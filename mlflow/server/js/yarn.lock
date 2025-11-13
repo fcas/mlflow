@@ -33471,9 +33471,11 @@ resolve@^0.6.1:
   linkType: hard
 
 "vega-interpreter@npm:^1.0.4":
-  version: 1.0.4
-  resolution: "vega-interpreter@npm:1.0.4"
-  checksum: 84756bd6d9289872da928b90bada6415d3d89def7bdd7c6a99a6eb62a449c83b87195849ca8774facdb7edba264c68590c2250e82d15ac7a06523b30b63882e9
+  version: 1.2.1
+  resolution: "vega-interpreter@npm:1.2.1"
+  dependencies:
+    vega-util: ^1.17.4
+  checksum: 259762ee5710efa894778cad2ce7cae120a573c50ade0fd460d5240f06048d5786d0859f53e17d19e930737b9497f4cc2de49e8d5382e932d36c18a33edba526
   languageName: node
   linkType: hard
 
@@ -33744,6 +33746,13 @@ resolve@^0.6.1:
   version: 1.17.2
   resolution: "vega-util@npm:1.17.2"
   checksum: 5d681cb1a6ffda7af1b74df7c1c46a32f1d874daef54f9c9c65c7d7c7bfc4271dc6d9b1c1c7a853b14eb6e4cc8ec811b0132cd3ea25fa85259eac92e1b4f07fa
+  languageName: node
+  linkType: hard
+
+"vega-util@npm:^1.17.4":
+  version: 1.17.4
+  resolution: "vega-util@npm:1.17.4"
+  checksum: 07b4808fc5d43afc20566a15f4d02465c13d20ec8f36859f4be3ffad9ed3b12220c20efaa12aaf9bcc7b0a07003a513f038cbcebc6e3e90e2bfc3456be085bd0
   languageName: node
   linkType: hard
 
