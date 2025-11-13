@@ -89,7 +89,7 @@
     "stream-browserify": "^3.0.0",
     "stylis": "^4.0.10",
     "url": "^0.11.0",
-    "vega": "^5.27.0",
+    "vega": "^6.2.0",
     "vega-lite": "^5.14.1"
   },
   "devDependencies": {
