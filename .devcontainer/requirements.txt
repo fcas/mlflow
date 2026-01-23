@@ -459,7 +459,7 @@ prometheus-client==0.20.0
     #   starlette-exporter
 prompt-toolkit==3.0.43
     # via ipython
-protobuf==4.25.3
+protobuf==7.34.0rc1
     # via
     #   -r skinny-requirements.txt
     #   mlflow
