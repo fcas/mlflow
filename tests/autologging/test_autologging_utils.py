@@ -1,13 +1,15 @@
+import importlib
 import inspect
 import sys
 import time
-from collections import namedtuple
+from typing import Any, NamedTuple
 from unittest import mock
 
 import pytest
 
 import mlflow
 from mlflow import MlflowClient
+from mlflow.ml_package_versions import FLAVOR_TO_MODULE_NAME
 from mlflow.utils import gorilla
 from mlflow.utils.autologging_utils import (
     AUTOLOGGING_INTEGRATIONS,
@@ -24,7 +26,6 @@ from mlflow.utils.autologging_utils import (
 )
 from mlflow.utils.autologging_utils.safety import AutologgingSession, _wrap_patch
 from mlflow.utils.autologging_utils.versioning import (
-    FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY,
     _check_version_in_range,
     _is_pre_or_dev_release,
     _strip_dev_version_suffix,
@@ -120,7 +121,9 @@ def test_log_fn_args_as_params(args, kwargs, expected, start_run):
 def test_log_fn_args_as_params_ignores_unwanted_parameters(
     start_run,
 ):
-    args, kwargs, unlogged = ("arg1", {"arg2": "value"}, ["arg1", "arg2", "arg3"])
+    args = "arg1"
+    kwargs = {"arg2": "value"}
+    unlogged = ["arg1", "arg2", "arg3"]
     log_fn_args_as_params(dummy_fn, args, kwargs, unlogged)
     client = MlflowClient()
     params = client.get_run(mlflow.active_run().info.run_id).data.params
@@ -198,7 +201,7 @@ def test_if_getting_input_example_fails(logger):
             + error_msg
         ),
     ]
-    assert logger.warning.has_calls(calls)
+    logger.warning.assert_has_calls(calls)
 
 
 def test_if_model_signature_inference_fails(logger):
@@ -369,8 +372,9 @@ def test_batch_metrics_logger_records_time_correctly(start_run):
 
 
 def test_batch_metrics_logger_logs_timestamps_as_int_milliseconds(start_run):
-    with mock.patch.object(MlflowClient, "log_batch") as log_batch_mock, mock.patch(
-        "time.time", return_value=123.45678901234567890
+    with (
+        mock.patch.object(MlflowClient, "log_batch") as log_batch_mock,
+        mock.patch("time.time", return_value=123.45678901234567890),
     ):
         run_id = mlflow.active_run().info.run_id
         with batch_metrics_logger(run_id) as metrics_logger:
@@ -464,7 +468,10 @@ def test_autologging_integration_makes_expected_event_logging_calls():
         raise Exception("autolog failed")
 
     class TestLogger(AutologgingEventLogger):
-        LoggerCall = namedtuple("LoggerCall", ["integration", "call_args", "call_kwargs"])
+        class LoggerCall(NamedTuple):
+            integration: Any
+            call_args: Any
+            call_kwargs: Any
 
         def __init__(self):
             self.calls = []
@@ -598,7 +605,7 @@ def test_autologging_disable_restores_behavior():
     assert is_autolog_on()
 
     # The context manager should exit correctly even if an exception is raised
-    with pytest.raises(Exception, match="test"):  # noqa: PT012
+    with pytest.raises(Exception, match="test"):  # noqa PT012
         with mlflow.utils.autologging_utils.disable_autologging():
             assert not is_autolog_on()
             raise Exception("test")
@@ -705,89 +712,22 @@ def test_violates_pep_440():
     assert not _violates_pep_440("0.24.0")
 
 
-_module_version_info_dict_patch = {
-    "sklearn": {
-        "package_info": {"pip_release": "scikit-learn"},
-        "autologging": {"minimum": "0.20.3", "maximum": "0.23.2"},
-    },
-    "pytorch-lightning": {
-        "package_info": {"pip_release": "pytorch-lightning"},
-        "autologging": {"minimum": "1.0.5", "maximum": "1.1.2"},
-    },
-    "pytorch": {
-        "package_info": {"pip_release": "torch"},
-        "autologging": {"minimum": "1.6.0", "maximum": "1.13.1"},
-    },
-    "tensorflow": {
-        "package_info": {"pip_release": "tensorflow"},
-        "autologging": {"minimum": "1.15.4", "maximum": "2.3.1"},
-    },
-    "keras": {
-        "package_info": {"pip_release": "keras"},
-        "autologging": {"minimum": "2.2.4", "maximum": "2.4.3"},
-    },
-    "xgboost": {
-        "package_info": {"pip_release": "xgboost"},
-        "autologging": {"minimum": "0.90", "maximum": "1.2.1"},
-    },
-    "lightgbm": {
-        "package_info": {"pip_release": "lightgbm"},
-        "autologging": {"minimum": "2.3.1", "maximum": "3.1.0"},
-    },
-    "fastai": {
-        "package_info": {"pip_release": "fastai"},
-        "autologging": {"minimum": "2.4.1", "maximum": "2.4.1"},
-    },
-    "statsmodels": {
-        "package_info": {"pip_release": "statsmodels"},
-        "autologging": {"minimum": "0.11.1", "maximum": "0.12.2"},
-    },
-    "spark": {
-        "package_info": {"pip_release": "pyspark"},
-        "autologging": {"minimum": "3.0.1", "maximum": "3.1.1"},
-    },
-    "transformers": {
-        "package_info": {"pip_release": "transformers"},
-        "autologging": {"minimum": "1.25.1", "maximum": "1.28.1"},
-    },
-}
-
-
 @pytest.mark.parametrize(
     ("flavor", "module_version", "expected_result"),
     [
-        ("fastai", "2.4.1", True),
-        ("fastai", "2.3.1", False),
-        ("fastai", "1.0.60", False),
-        ("keras", "2.2.4", True),
-        ("keras", "2.2.3", False),
-        ("lightgbm", "2.3.1", True),
-        ("lightgbm", "2.3.0", False),
-        ("statsmodels", "0.11.1", True),
-        ("statsmodels", "0.11.0", False),
-        ("tensorflow", "1.15.4", True),
-        ("tensorflow", "1.15.3", False),
-        ("xgboost", "0.90", True),
-        ("xgboost", "0.89", False),
-        ("sklearn", "0.20.3", True),
         ("sklearn", "0.20.2", False),
         ("sklearn", "0.23.0rc1", False),
         ("sklearn", "0.23.0dev0", False),
         ("sklearn", "0.23.0-SNAPSHOT", False),
-        ("pytorch", "1.6.0", True),
         ("pytorch", "1.5.99", False),
-        ("pyspark.ml", "3.1.0", True),
+        ("pyspark.ml", "3.5.1", True),
         ("pyspark.ml", "3.0.0", False),
-        ("transformers", "1.28.1", True),
-        ("transformers", "1.1.1", False),
+        ("llama_index", "0.13.1", True),
+        ("llama_index", "0.1.2", False),
     ],
 )
-@mock.patch(
-    "mlflow.utils.autologging_utils.versioning._ML_PACKAGE_VERSIONS",
-    _module_version_info_dict_patch,
-)
 def test_is_autologging_integration_supported(flavor, module_version, expected_result):
-    module_name, _ = FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY[flavor]
+    module_name = FLAVOR_TO_MODULE_NAME[flavor]
     with mock.patch(module_name + ".__version__", module_version):
         assert expected_result == is_flavor_supported_for_associated_package_versions(flavor)
 
@@ -795,18 +735,19 @@ def test_is_autologging_integration_supported(flavor, module_version, expected_r
 @pytest.mark.parametrize(
     ("flavor", "module_version", "expected_result"),
     [
-        ("pyspark.ml", "3.10.1.dev0", False),
+        ("pyspark.ml", "99.0.0.dev0", False),
         ("pyspark.ml", "3.5.0.dev0", True),
-        ("pyspark.ml", "3.3.0.dev0", True),
-        ("pyspark.ml", "3.2.1.dev0", True),
-        ("pyspark.ml", "3.1.2.dev0", True),
+        ("pyspark.ml", "3.4.4.dev0", True),
+        ("pyspark.ml", "3.3.0.dev0", False),
+        ("pyspark.ml", "3.2.1.dev0", False),
+        ("pyspark.ml", "3.1.2.dev0", False),
         ("pyspark.ml", "3.0.1.dev0", False),
         ("pyspark.ml", "3.0.0.dev0", False),
         ("pyspark.ml", "2.4.8.dev0", False),
     ],
 )
 def test_dev_version_pyspark_is_supported_in_databricks(flavor, module_version, expected_result):
-    module_name, _ = FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY[flavor]
+    module_name = FLAVOR_TO_MODULE_NAME[flavor]
     with mock.patch(module_name + ".__version__", module_version):
         # In Databricks
         with mock.patch(
@@ -820,19 +761,12 @@ def test_dev_version_pyspark_is_supported_in_databricks(flavor, module_version, 
         assert is_flavor_supported_for_associated_package_versions(flavor) is False
 
 
-@mock.patch(
-    "mlflow.utils.autologging_utils.versioning._ML_PACKAGE_VERSIONS",
-    _module_version_info_dict_patch,
-)
 def test_disable_for_unsupported_versions_warning_sklearn_integration():
     log_warn_fn_name = "mlflow.utils.autologging_utils._logger.warning"
     log_info_fn_name = "mlflow.tracking.fluent._logger.info"
 
     def is_sklearn_warning_fired(log_warn_fn_args):
-        return (
-            "You are using an unsupported version of" in log_warn_fn_args[0][0]
-            and log_warn_fn_args[0][1] == "sklearn"
-        )
+        return "MLflow sklearn autologging is known to be compatible" in log_warn_fn_args[0][0]
 
     def is_sklearn_autolog_enabled_info_fired(log_info_fn_args):
         return (
@@ -840,19 +774,21 @@ def test_disable_for_unsupported_versions_warning_sklearn_integration():
             and log_info_fn_args[0][1] == "sklearn"
         )
 
-    with mock.patch("sklearn.__version__", "0.20.3"):
+    with mock.patch("sklearn.__version__", "1.5.2"):
         AUTOLOGGING_INTEGRATIONS.clear()
-        with mock.patch(log_warn_fn_name) as log_warn_fn, mock.patch(
-            log_info_fn_name
-        ) as log_info_fn:
+        with (
+            mock.patch(log_warn_fn_name) as log_warn_fn,
+            mock.patch(log_info_fn_name) as log_info_fn,
+        ):
             mlflow.autolog(disable_for_unsupported_versions=True)
             assert all(not is_sklearn_warning_fired(args) for args in log_warn_fn.call_args_list)
             assert any(
                 is_sklearn_autolog_enabled_info_fired(args) for args in log_info_fn.call_args_list
             )
-        with mock.patch(log_warn_fn_name) as log_warn_fn, mock.patch(
-            log_info_fn_name
-        ) as log_info_fn:
+        with (
+            mock.patch(log_warn_fn_name) as log_warn_fn,
+            mock.patch(log_info_fn_name) as log_info_fn,
+        ):
             mlflow.autolog(disable_for_unsupported_versions=False)
             assert all(not is_sklearn_warning_fired(args) for args in log_warn_fn.call_args_list)
             assert any(
@@ -868,18 +804,20 @@ def test_disable_for_unsupported_versions_warning_sklearn_integration():
 
     with mock.patch("sklearn.__version__", "0.20.2"):
         AUTOLOGGING_INTEGRATIONS.clear()
-        with mock.patch(log_warn_fn_name) as log_warn_fn, mock.patch(
-            log_info_fn_name
-        ) as log_info_fn:
+        with (
+            mock.patch(log_warn_fn_name) as log_warn_fn,
+            mock.patch(log_info_fn_name) as log_info_fn,
+        ):
             mlflow.autolog(disable_for_unsupported_versions=True)
             assert all(not is_sklearn_warning_fired(args) for args in log_warn_fn.call_args_list)
             assert all(
                 not is_sklearn_autolog_enabled_info_fired(args)
                 for args in log_info_fn.call_args_list
             )
-        with mock.patch(log_warn_fn_name) as log_warn_fn, mock.patch(
-            log_info_fn_name
-        ) as log_info_fn:
+        with (
+            mock.patch(log_warn_fn_name) as log_warn_fn,
+            mock.patch(log_info_fn_name) as log_info_fn,
+        ):
             mlflow.autolog(disable_for_unsupported_versions=False)
             assert any(is_sklearn_warning_fired(args) for args in log_warn_fn.call_args_list)
             assert any(
@@ -892,6 +830,17 @@ def test_disable_for_unsupported_versions_warning_sklearn_integration():
             mlflow.sklearn.autolog(disable_for_unsupported_versions=False)
             assert log_warn_fn.call_count == 1
             assert is_sklearn_warning_fired(log_warn_fn.call_args)
+
+
+def test_unsupported_versions_warning_should_not_shown_for_excluded_packages():
+    with mock.patch("langchain.__version__", "100.200.300"):
+        AUTOLOGGING_INTEGRATIONS.clear()
+        with mock.patch("mlflow.utils.autologging_utils._logger.warning") as log_warn_fn:
+            mlflow.langchain.autolog()
+            assert len(log_warn_fn.call_args_list) == 0 or (
+                "MLflow langchain autologging is known to be compatible"
+                not in log_warn_fn.call_args_list[0][0]
+            )
 
 
 def test_get_instance_method_first_arg_value():
@@ -923,3 +872,73 @@ def test_get_method_call_arg_value():
     assert get_method_call_arg_value(1, "b", 3, [1, 2], {}) == 2
     assert get_method_call_arg_value(1, "b", 3, [1], {}) == 3
     assert get_method_call_arg_value(1, "b", 3, [1], {"b": 2}) == 2
+
+
+def test_is_flavor_supported_returns_true_when_flavor_module_not_installed(monkeypatch):
+    """When a flavor's mapping module (e.g. 'langchain') is not installed but a subset package
+    (e.g. 'langchain-core') is present, is_flavor_supported_for_associated_package_versions
+    must return True rather than raising ModuleNotFoundError.
+
+    Regression test for: mlflow.langchain.autolog() raises ModuleNotFoundError when only
+    langchain-core + langgraph are installed (not the full 'langchain' package).
+
+    Uses monkeypatch so the test is portable — it exercises the ModuleNotFoundError branch
+    regardless of whether 'langchain' is installed in the test environment.
+    """
+    original_import = importlib.import_module
+
+    def fake_import_absent(name, *args, **kwargs):
+        if name == "langchain":
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_absent)
+
+    # Flavor's own module absent -> skip the version check, return True.
+    result = is_flavor_supported_for_associated_package_versions("langchain")
+    assert result is True
+
+
+def test_is_flavor_supported_reraises_unrelated_module_not_found(monkeypatch):
+    """When the flavor module is installed but a transitive dependency is missing,
+    the ModuleNotFoundError must propagate rather than being silently swallowed.
+
+    This prevents masking genuine installation errors where the flavor itself is
+    present but broken (e.g. one of its own dependencies is missing).
+    """
+    original_import = importlib.import_module
+
+    def fake_import_transitive(name, *args, **kwargs):
+        if name == "langchain":
+            # Simulate: langchain is installed, but importing it fails because
+            # one of its transitive deps ("some_unrelated_dep") is absent.
+            err = ModuleNotFoundError("No module named 'some_unrelated_dep'")
+            err.name = "some_unrelated_dep"
+            raise err
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_transitive)
+
+    with pytest.raises(ModuleNotFoundError, match="some_unrelated_dep"):
+        is_flavor_supported_for_associated_package_versions("langchain")
+
+
+def test_is_flavor_supported_returns_true_when_dotted_module_parent_not_installed(monkeypatch):
+    """For dotted mappings like gemini -> "google.genai", importing the module when the
+    top-level package is entirely absent raises ModuleNotFoundError with e.name set to the
+    parent ("google"), not the full dotted path. The prefix check must treat this as the
+    flavor's own module being absent and skip the version check.
+    """
+    assert FLAVOR_TO_MODULE_NAME["gemini"] == "google.genai"
+
+    original_import = importlib.import_module
+
+    def fake_import_parent_absent(name, *args, **kwargs):
+        if name == "google.genai":
+            raise ModuleNotFoundError("No module named 'google'", name="google")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_parent_absent)
+
+    result = is_flavor_supported_for_associated_package_versions("gemini")
+    assert result is True

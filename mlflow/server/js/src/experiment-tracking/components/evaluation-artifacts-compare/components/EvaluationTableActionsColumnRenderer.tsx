@@ -11,8 +11,9 @@ export const EvaluationTableActionsColumnRenderer = () => {
   return (
     <EvaluationTableHeader>
       <Tooltip
-        placement="right"
-        title={
+        componentId="mlflow.experiment-tracking.evaluation-table-column.toggle-detail"
+        side="right"
+        content={
           <FormattedMessage
             defaultMessage="Toggle detailed view"
             description='Experiment page > artifact compare view > table header > label for "toggle detailed view" button'

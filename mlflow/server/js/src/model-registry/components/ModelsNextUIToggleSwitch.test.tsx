@@ -1,5 +1,6 @@
+import { jest, describe, test, expect } from '@jest/globals';
 import userEvent from '@testing-library/user-event';
-import { renderWithIntl, act, screen, within } from 'common/utils/TestUtils.react17';
+import { renderWithIntl, act, screen, within } from '@mlflow/mlflow/src/common/utils/TestUtils.react18';
 import { useNextModelsUIContext, withNextModelsUIContext } from '../hooks/useNextModelsUI';
 import { ModelsNextUIToggleSwitch } from './ModelsNextUIToggleSwitch';
 
@@ -27,18 +28,11 @@ describe('ModelsNextUIToggleSwitch', () => {
   const mockUnseenPromoModal = () =>
     jest.spyOn(window.localStorage, 'getItem').mockImplementation((key) => (key.match(/promo/) ? 'false' : ''));
 
-  test('it should render the switch and display the promo modal', () => {
+  test('it should render the switch without the promo modal (promo is rendered at the page level)', () => {
     mockUnseenPromoModal();
 
     renderTestComponent();
     expect(screen.getByRole('switch', { name: /New model registry UI/ })).toBeInTheDocument();
-    expect(within(screen.getByRole('dialog')).getByText(/Flexible, governed deployments/)).toBeInTheDocument();
-  });
-
-  test("it should not render display the promo modal when it's already seen", () => {
-    mockSeenPromoModal();
-    renderTestComponent();
-    expect(screen.getByRole('switch')).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
@@ -54,9 +48,7 @@ describe('ModelsNextUIToggleSwitch', () => {
 
     expect(screen.getByText('enabled')).toBeInTheDocument();
 
-    await act(async () => {
-      userEvent.click(screen.getByRole('switch'));
-    });
+    await userEvent.click(screen.getByRole('switch'));
 
     expect(within(screen.getByRole('dialog')).getByText(/your feedback is invaluable/)).toBeInTheDocument();
   });
@@ -73,19 +65,13 @@ describe('ModelsNextUIToggleSwitch', () => {
 
     expect(screen.getByText('enabled')).toBeInTheDocument();
 
-    await act(async () => {
-      userEvent.click(screen.getByRole('switch'));
-    });
+    await userEvent.click(screen.getByRole('switch'));
 
-    await act(async () => {
-      userEvent.click(screen.getByText('Disable'));
-    });
+    await userEvent.click(screen.getByText('Disable'));
 
     expect(screen.getByText('disabled')).toBeInTheDocument();
 
-    await act(async () => {
-      userEvent.click(screen.getByRole('switch'));
-    });
+    await userEvent.click(screen.getByRole('switch'));
 
     expect(screen.getByText('enabled')).toBeInTheDocument();
   });

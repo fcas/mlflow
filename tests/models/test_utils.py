@@ -1,29 +1,41 @@
+import os
 import random
-from collections import namedtuple
+from typing import Any, NamedTuple
 from unittest import mock
 
 import numpy as np
+import pandas as pd
 import pytest
-import sklearn.neighbors as knn
+import sklearn.linear_model as logreg_module
 from sklearn import datasets
 
 import mlflow
 from mlflow import MlflowClient
 from mlflow.entities.model_registry import ModelVersion
+from mlflow.environment_variables import MLFLOW_DISABLE_SCHEMA_DETAILS
 from mlflow.exceptions import MlflowException
 from mlflow.models import add_libraries_to_model
 from mlflow.models.utils import (
+    _config_context,
+    _convert_llm_input_data,
     _enforce_array,
     _enforce_datatype,
+    _enforce_mlflow_datatype,
     _enforce_object,
     _enforce_property,
+    _flatten_nested_params,
+    _validate_and_get_model_code_path,
     _validate_model_code_from_notebook,
     get_model_version_from_model_uri,
 )
-from mlflow.types import DataType
-from mlflow.types.schema import Array, Object, Property
+from mlflow.pyfunc import _enforce_schema, _validate_prediction_input
+from mlflow.types import DataType, Schema
+from mlflow.types.schema import Array, ColSpec, Object, Property
 
-ModelWithData = namedtuple("ModelWithData", ["model", "inference_data"])
+
+class ModelWithData(NamedTuple):
+    model: Any
+    inference_data: Any
 
 
 @pytest.fixture(scope="module")
@@ -31,13 +43,13 @@ def sklearn_knn_model():
     iris = datasets.load_iris()
     X = iris.data[:, :2]  # we only take the first two features.
     y = iris.target
-    knn_model = knn.KNeighborsClassifier()
-    knn_model.fit(X, y)
-    return ModelWithData(model=knn_model, inference_data=X)
+    logreg_model = logreg_module.LogisticRegression()
+    logreg_model.fit(X, y)
+    return ModelWithData(model=logreg_model, inference_data=X)
 
 
 def random_int(lo=1, hi=1000000000):
-    return random.randint(lo, hi)
+    return random.randint(int(lo), int(hi))
 
 
 def test_adding_libraries_to_model_default(sklearn_knn_model):
@@ -50,8 +62,8 @@ def test_adding_libraries_to_model_default(sklearn_knn_model):
     with mlflow.start_run():
         run_id = mlflow.tracking.fluent._get_or_start_run().info.run_id
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
 
@@ -74,8 +86,8 @@ def test_adding_libraries_to_model_new_run(sklearn_knn_model):
     with mlflow.start_run():
         original_run_id = mlflow.tracking.fluent._get_or_start_run().info.run_id
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
 
@@ -101,8 +113,8 @@ def test_adding_libraries_to_model_run_id_passed(sklearn_knn_model):
     with mlflow.start_run():
         original_run_id = mlflow.tracking.fluent._get_or_start_run().info.run_id
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
 
@@ -129,8 +141,8 @@ def test_adding_libraries_to_model_new_model_name(sklearn_knn_model):
     # Log a model
     with mlflow.start_run():
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
 
@@ -157,8 +169,8 @@ def test_adding_libraries_to_model_when_version_source_None(sklearn_knn_model):
     with mlflow.start_run():
         original_run_id = mlflow.tracking.fluent._get_or_start_run().info.run_id
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
 
@@ -202,6 +214,22 @@ def test_enforce_datatype_with_errors():
         _enforce_datatype(123, DataType.string)
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pd.StringDtype(),
+        "string",
+        object,
+        None,  # infers object in pandas <3.0, StringDtype in pandas 3.0
+    ],
+)
+def test_enforce_mlflow_datatype_with_string_dtype(dtype):
+    # Test that string dtypes are handled correctly (pandas 3.0 compatibility)
+    series = pd.Series(["a", "b", "c"], dtype=dtype)
+    result = _enforce_mlflow_datatype("col", series, DataType.string)
+    assert result is series
+
+
 def test_enforce_object():
     data = {
         "a": "some_sentence",
@@ -209,22 +237,18 @@ def test_enforce_object():
         "c": ["sentence1", "sentence2"],
         "d": {"str": "value", "arr": [0.1, 0.2]},
     }
-    obj = Object(
-        [
-            Property("a", DataType.string),
-            Property("b", DataType.binary, required=False),
-            Property("c", Array(DataType.string)),
-            Property(
-                "d",
-                Object(
-                    [
-                        Property("str", DataType.string),
-                        Property("arr", Array(DataType.double), required=False),
-                    ]
-                ),
-            ),
-        ]
-    )
+    obj = Object([
+        Property("a", DataType.string),
+        Property("b", DataType.binary, required=False),
+        Property("c", Array(DataType.string)),
+        Property(
+            "d",
+            Object([
+                Property("str", DataType.string),
+                Property("arr", Array(DataType.double), required=False),
+            ]),
+        ),
+    ])
     assert _enforce_object(data, obj) == data
 
     data = {"a": "some_sentence", "c": ["sentence1", "sentence2"], "d": {"str": "some_value"}}
@@ -264,7 +288,7 @@ def test_enforce_property():
     assert _enforce_property(data, prop) == data
 
     prop = Property("a", Array(DataType.binary))
-    assert _enforce_property(data, prop) == data
+    assert _enforce_property(data, prop) == [b"some_sentence1", b"some_sentence2"]
 
     data = np.array([np.int32(1), np.int32(2)])
     prop = Property("a", Array(DataType.integer))
@@ -278,22 +302,18 @@ def test_enforce_property():
     }
     prop = Property(
         "any_name",
-        Object(
-            [
-                Property("a", DataType.string),
-                Property("b", DataType.binary, required=False),
-                Property("c", Array(DataType.string), required=False),
-                Property(
-                    "d",
-                    Object(
-                        [
-                            Property("str", DataType.string),
-                            Property("arr", Array(DataType.double), required=False),
-                        ]
-                    ),
-                ),
-            ]
-        ),
+        Object([
+            Property("a", DataType.string),
+            Property("b", DataType.binary, required=False),
+            Property("c", Array(DataType.string), required=False),
+            Property(
+                "d",
+                Object([
+                    Property("str", DataType.string),
+                    Property("arr", Array(DataType.double), required=False),
+                ]),
+            ),
+        ]),
     )
     assert _enforce_property(data, prop) == data
     data = {"a": "some_sentence", "d": {"str": "some_value"}}
@@ -346,13 +366,11 @@ def test_enforce_property_with_errors():
                 {"a": "some_sentence3", "c": ["some_sentence4", "some_sentence5"]},
             ],
             Array(
-                Object(
-                    [
-                        Property("a", DataType.string),
-                        Property("b", DataType.string, required=False),
-                        Property("c", Array(DataType.string), required=False),
-                    ]
-                )
+                Object([
+                    Property("a", DataType.string),
+                    Property("b", DataType.string, required=False),
+                    Property("c", Array(DataType.string), required=False),
+                ])
             ),
         ),
         # 4. Empty list
@@ -370,12 +388,10 @@ def test_enforce_array_on_list(data, schema):
         (np.array(["some_sentence1", "some_sentence2"]), Array(DataType.string)),
         # 2. 2D array
         (
-            np.array(
-                [
-                    ["a", "b"],
-                    ["c", "d"],
-                ]
-            ),
+            np.array([
+                ["a", "b"],
+                ["c", "d"],
+            ]),
             Array(Array(DataType.string)),
         ),
         # 3. Empty array
@@ -390,15 +406,11 @@ def test_enforce_array_with_errors():
     with pytest.raises(MlflowException, match=r"Expected data to be list or numpy array, got str"):
         _enforce_array("abc", Array(DataType.string))
 
-    with pytest.raises(
-        MlflowException, match=r"Failed to enforce schema of data `123` with dtype `string`"
-    ):
+    with pytest.raises(MlflowException, match=r"Incompatible input types"):
         _enforce_array([123, 456, 789], Array(DataType.string))
 
     # Nested array with mixed type elements
-    with pytest.raises(
-        MlflowException, match=r"Failed to enforce schema of data `1` with dtype `string`"
-    ):
+    with pytest.raises(MlflowException, match=r"Incompatible input types"):
         _enforce_array([["a", "b"], [1, 2]], Array(Array(DataType.string)))
 
     # Nested array with different nest level
@@ -425,9 +437,10 @@ def test_enforce_array_with_errors():
                 {"a": "some_sentence3", "c": ["some_sentence4", "some_sentence5"]},
             ],
             Array(
-                Object(
-                    [Property("a", DataType.string), Property("b", DataType.string, required=False)]
-                )
+                Object([
+                    Property("a", DataType.string),
+                    Property("b", DataType.string, required=False),
+                ])
             ),
         )
 
@@ -436,12 +449,15 @@ def test_model_code_validation():
     # Invalid code with dbutils
     invalid_code = "dbutils.library.restartPython()\nsome_python_variable = 5"
 
-    with pytest.raises(
-        ValueError, match="The model file uses 'dbutils' command which is not supported."
-    ):
+    with mock.patch("mlflow.models.utils._logger.warning") as mock_warning:
         _validate_model_code_from_notebook(invalid_code)
+        mock_warning.assert_called_once_with(
+            "The model file uses 'dbutils' commands which are not supported. To ensure your "
+            "code functions correctly, make sure that it does not rely on these dbutils "
+            "commands for correctness."
+        )
 
-    # Code with commended magic commands displays warning
+    # Code with commented magic commands displays warning
     warning_code = "# dbutils.library.restartPython()\n# MAGIC %run ../wheel_installer"
 
     with mock.patch("mlflow.models.utils._logger.warning") as mock_warning:
@@ -451,6 +467,12 @@ def test_model_code_validation():
             "functions correctly, make sure that it does not rely on these magic commands for "
             "correctness."
         )
+
+    # Code with commented pip magic commands does not warn
+    warning_code = "# MAGIC %pip install mlflow"
+    with mock.patch("mlflow.models.utils._logger.warning") as mock_warning:
+        _validate_model_code_from_notebook(warning_code)
+        mock_warning.assert_not_called()
 
     # Test valid code
     valid_code = "some_valid_python_code = 'valid'"
@@ -471,3 +493,165 @@ def test_model_code_validation():
         code_with_magic_command
     ).decode("utf-8")
     assert validated_code_with_magic_command == expected_validated_code
+
+
+def test_config_context():
+    with _config_context("tests/langchain/config.yml"):
+        assert mlflow.models.model_config.__mlflow_model_config__ == "tests/langchain/config.yml"
+
+    assert mlflow.models.model_config.__mlflow_model_config__ is None
+
+
+def test_flatten_nested_params():
+    nested_params = {
+        "a": 1,
+        "b": {"c": 2, "d": {"e": 3}},
+        "f": {"g": {"h": 4}},
+    }
+    expected_flattened_params = {
+        "a": 1,
+        "b.c": 2,
+        "b.d.e": 3,
+        "f.g.h": 4,
+    }
+    assert _flatten_nested_params(nested_params, sep=".") == expected_flattened_params
+    assert _flatten_nested_params(nested_params, sep="/") == {
+        "a": 1,
+        "b/c": 2,
+        "b/d/e": 3,
+        "f/g/h": 4,
+    }
+    assert _flatten_nested_params({}) == {}
+
+    params = {"a": 1, "b": 2, "c": 3}
+    assert _flatten_nested_params(params) == params
+
+    params = {
+        "a": 1,
+        "b": {"c": 2, "d": {"e": 3, "f": [1, 2, 3]}, "g": "hello"},
+        "h": {"i": None},
+    }
+    expected_flattened_params = {
+        "a": 1,
+        "b/c": 2,
+        "b/d/e": 3,
+        "b/d/f": [1, 2, 3],
+        "b/g": "hello",
+        "h/i": None,
+    }
+    assert _flatten_nested_params(params) == expected_flattened_params
+
+    nested_params = {1: {2: {3: 4}}, "a": {"b": {"c": 5}}}
+    expected_flattened_params_mixed = {
+        "1/2/3": 4,
+        "a/b/c": 5,
+    }
+    assert _flatten_nested_params(nested_params) == expected_flattened_params_mixed
+
+    rag_params = {
+        "workspace_url": "https://e2-dogfood.staging.cloud.databricks.com",
+        "vector_search_endpoint_name": "dbdemos_vs_endpoint",
+        "vector_search_index": "monitoring.rag.databricks_docs_index",
+        "embedding_model_endpoint_name": "databricks-bge-large-en",
+        "embedding_model_query_instructions": "Represent this sentence for searching",
+        "llm_model": "databricks-dbrx-instruct",
+        "llm_prompt_template": "You are a trustful assistant for Databricks users.",
+        "retriever_config": {"k": 5, "use_mmr": "false"},
+        "llm_parameters": {"temperature": 0.01, "max_tokens": 200},
+        "llm_prompt_template_variables": ["chat_history", "context", "question"],
+        "secret_scope": "dbdemos",
+        "secret_key": "rag_sunish",
+    }
+
+    expected_rag_flattened_params = {
+        "workspace_url": "https://e2-dogfood.staging.cloud.databricks.com",
+        "vector_search_endpoint_name": "dbdemos_vs_endpoint",
+        "vector_search_index": "monitoring.rag.databricks_docs_index",
+        "embedding_model_endpoint_name": "databricks-bge-large-en",
+        "embedding_model_query_instructions": "Represent this sentence for searching",
+        "llm_model": "databricks-dbrx-instruct",
+        "llm_prompt_template": "You are a trustful assistant for Databricks users.",
+        "retriever_config/k": 5,
+        "retriever_config/use_mmr": "false",
+        "llm_parameters/temperature": 0.01,
+        "llm_parameters/max_tokens": 200,
+        "llm_prompt_template_variables": ["chat_history", "context", "question"],
+        "secret_scope": "dbdemos",
+        "secret_key": "rag_sunish",
+    }
+
+    assert _flatten_nested_params(rag_params) == expected_rag_flattened_params
+
+
+@pytest.mark.parametrize(
+    ("data", "target", "target_type"),
+    [
+        (pd.DataFrame([{"a": [1, 2, 3]}]), [{"a": [1, 2, 3]}], list),
+        (pd.DataFrame([{"a": np.array([1, 2, 3])}]), [{"a": [1, 2, 3]}], list),
+        (pd.DataFrame([{0: np.array(["abc"])[0]}]), ["abc"], list),
+        (np.array([1, 2, 3]), [1, 2, 3], list),
+        (np.array([123])[0], 123, int),
+        (np.array(["abc"])[0], "abc", str),
+    ],
+)
+def test_convert_llm_input_data(data, target, target_type):
+    result = _convert_llm_input_data(data)
+    assert result == target
+    assert type(result) == target_type
+
+
+@pytest.mark.parametrize(
+    ("model_path", "error_message"),
+    [
+        (
+            "model.py",
+            f"The provided model path '{os.getcwd()}/model.py' does not exist. "
+            "Ensure the file path is valid and try again.",
+        ),
+        (
+            "model",
+            f"The provided model path '{os.getcwd()}/model' does not exist. "
+            "Ensure the file path is valid and try again. "
+            f"Perhaps you meant '{os.getcwd()}/model.py'?",
+        ),
+    ],
+)
+def test_validate_and_get_model_code_path_not_found(model_path, error_message, tmp_path):
+    with pytest.raises(MlflowException, match=error_message):
+        _validate_and_get_model_code_path(model_path, tmp_path)
+
+
+def test_validate_and_get_model_code_path_success(tmp_path):
+    # if the model file exists, return the path as is
+    model_path = os.path.abspath(__file__)
+    actual = _validate_and_get_model_code_path(model_path, tmp_path)
+
+    assert actual == model_path
+
+
+def test_suppress_schema_error(monkeypatch):
+    schema = Schema([
+        ColSpec("double", "id"),
+        ColSpec("string", "name"),
+    ])
+    monkeypatch.setenv(MLFLOW_DISABLE_SCHEMA_DETAILS.name, "true")
+    data = pd.DataFrame({"id": [1, 2]}, dtype="float64")
+
+    with pytest.raises(
+        MlflowException,
+        match=r"Failed to enforce model input schema. Please check your input data.",
+    ):
+        _validate_prediction_input(data, None, schema, None)
+
+
+def test_enforce_schema_with_missing_and_extra_columns(monkeypatch):
+    schema = Schema([
+        ColSpec("long", "id"),
+        ColSpec("string", "name"),
+    ])
+    monkeypatch.setenv(MLFLOW_DISABLE_SCHEMA_DETAILS.name, "true")
+    input_data = pd.DataFrame({"id": [1, 2], "extra_col": ["mlflow", "oss"]})
+    with pytest.raises(
+        MlflowException, match=r"Input schema validation failed.*extra inputs provided"
+    ):
+        _enforce_schema(input_data, schema)

@@ -1,14 +1,14 @@
 import { Button, CloseIcon } from '@databricks/design-system';
-import { EmotionJSX, WithConditionalCSSProp } from '@emotion/react/types/jsx-namespace';
 import React, { PropsWithChildren, ReactNode, useState } from 'react';
 import { IntlProvider } from 'react-intl';
-import { RunInfoEntity } from '../../../types';
+import type { RunInfoEntity } from '../../../types';
 import { chartColors, getRandomRunName, stableNormalRandom } from '../components/RunsCharts.stories-common';
 import { RunsContourPlot } from '../components/RunsContourPlot';
 import { RunsMetricsBarPlot } from '../components/RunsMetricsBarPlot';
 import { RunsMetricsLinePlot } from '../components/RunsMetricsLinePlot';
 import { RunsScatterPlot } from '../components/RunsScatterPlot';
-import { RunsChartsTooltipBodyProps, RunsChartsTooltipWrapper, useRunsChartsTooltip } from './useRunsChartsTooltip';
+import type { RunsChartsTooltipBodyProps } from './useRunsChartsTooltip';
+import { RunsChartsTooltipWrapper, useRunsChartsTooltip } from './useRunsChartsTooltip';
 
 export default {
   title: 'Runs charts/Context menu',
@@ -25,7 +25,7 @@ const ContextMenuComponent = ({
   isHovering,
   closeContextMenu,
 }: RunsChartsTooltipBodyProps<{ runs: ReturnType<typeof createMockData> }>) => {
-  const run = contextData?.runs.find((x: any) => x.runInfo.run_uuid === runUuid);
+  const run = contextData?.runs.find((x: any) => x.runInfo.runUuid === runUuid);
 
   if (!run) {
     return null;
@@ -33,7 +33,7 @@ const ContextMenuComponent = ({
 
   return (
     <div>
-      <div>name: {run.runInfo.run_name}</div>
+      <div>name: {run.runInfo.runName}</div>
       <div>uuid: {runUuid}</div>
       <div>hovered menu id: {hoverData}</div>
       <div>mode: {isHovering ? 'hovering' : 'context menu'}</div>
@@ -78,8 +78,8 @@ const createMockData = (numRuns: number, numValues: number, negative = false) =>
 
     return {
       runInfo: {
-        run_uuid: `id-for-run-${runName}`,
-        run_name: runName,
+        runUuid: `id-for-run-${runName}`,
+        runName: runName,
       } as RunInfoEntity,
       metricsHistory: { metric1: metricsHistory },
       metrics: {
@@ -103,11 +103,10 @@ const createMockData = (numRuns: number, numValues: number, negative = false) =>
 const withChartMenuContext =
   <
     T,
-    P extends EmotionJSX.IntrinsicAttributes &
-      WithConditionalCSSProp<PropsWithChildren<T>> &
-      T & { children?: ReactNode },
+    P extends JSX.IntrinsicAttributes &
+      JSX.LibraryManagedAttributes<React.ComponentType<React.PropsWithChildren<T>>, React.PropsWithChildren<T>>,
   >(
-    Component: React.ComponentType<T>,
+    Component: React.ComponentType<React.PropsWithChildren<T>>,
   ) =>
   (props: P) => {
     const [data, setData] = useState(() => ({ runs: createMockData(15, 10) }));
@@ -122,8 +121,8 @@ const withChartMenuContext =
                   .slice()
                   .reverse()
                   .map((run) => (
-                    <li key={run.runInfo.run_uuid} style={{ fontWeight: 'bold', color: run.color }}>
-                      {run.runInfo.run_name}
+                    <li key={run.runInfo.runUuid} style={{ fontWeight: 'bold', color: run.color }}>
+                      {run.runInfo.runName}
                     </li>
                   ))}
               </ul>

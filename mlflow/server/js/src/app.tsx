@@ -1,30 +1,46 @@
-import React from 'react';
-import { ApolloProvider } from '@apollo/client';
-import { IntlProvider } from 'react-intl';
+/* eslint-disable @databricks/no-singleton-query-client -- OSS MLflow (oss_MLFlowRoot) uses singleton, file copied to OSS */
+import React, { useCallback, useMemo } from 'react';
+import { ApolloProvider } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
+import { RawIntlProvider } from 'react-intl';
+
+import 'font-awesome/css/font-awesome.css';
 import './index.css';
-import { ApplyGlobalStyles } from '@databricks/design-system';
+
+import { ApplyGlobalStyles, DesignSystemEventProvider } from '@databricks/design-system';
 import '@databricks/design-system/dist/index.css';
 import '@databricks/design-system/dist/index-dark.css';
-import App from './experiment-tracking/components/App';
 import { Provider } from 'react-redux';
 import store from './store';
 import { useI18nInit } from './i18n/I18nUtils';
 import { DesignSystemContainer } from './common/components/DesignSystemContainer';
-import { ConfigProvider } from 'antd';
+import { QueryClient, QueryClientProvider } from '@mlflow/mlflow/src/common/utils/reactQueryHooks';
+import { createApolloClient } from './graphql/client';
 import { LegacySkeleton } from '@databricks/design-system';
-import { shouldUsePathRouting } from './common/utils/FeatureUtils';
 // eslint-disable-next-line no-useless-rename
 import { MlflowRouter as MlflowRouter } from './MlflowRouter';
 import { useMLflowDarkTheme } from './common/hooks/useMLflowDarkTheme';
+import { DarkThemeProvider } from './common/contexts/DarkThemeContext';
+import { telemetryClient } from './telemetry';
+import { ServerInfoProvider } from './experiment-tracking/hooks/useServerInfo';
 
 export function MLFlowRoot() {
   // eslint-disable-next-line react-hooks/rules-of-hooks
-  const i18n = useI18nInit();
+  const intl = useI18nInit();
+
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const apolloClient = useMemo(() => createApolloClient(), []);
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const queryClient = useMemo(() => new QueryClient(), []);
 
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const [isDarkTheme, setIsDarkTheme, MlflowThemeGlobalStyles] = useMLflowDarkTheme();
 
-  if (!i18n) {
+  // eslint-disable-next-line react-hooks/rules-of-hooks
+  const logObservabilityEvent = useCallback((event: any) => {
+    telemetryClient.logEvent(event);
+  }, []);
+
+  if (!intl) {
     return (
       <DesignSystemContainer>
         <LegacySkeleton />
@@ -32,23 +48,25 @@ export function MLFlowRoot() {
     );
   }
 
-  const { locale, messages } = i18n;
-
   return (
-    <IntlProvider locale={locale} messages={messages}>
-      <Provider store={store}>
-        <DesignSystemContainer isDarkTheme={isDarkTheme}>
-          <ApplyGlobalStyles />
-          <MlflowThemeGlobalStyles />
-          <ConfigProvider prefixCls="ant">
-            {shouldUsePathRouting() ? (
-              <MlflowRouter isDarkTheme={isDarkTheme} setIsDarkTheme={setIsDarkTheme} />
-            ) : (
-              <App isDarkTheme={isDarkTheme} setIsDarkTheme={setIsDarkTheme} />
-            )}
-          </ConfigProvider>
-        </DesignSystemContainer>
-      </Provider>
-    </IntlProvider>
+    <ApolloProvider client={apolloClient}>
+      <RawIntlProvider value={intl} key={intl.locale}>
+        <Provider store={store}>
+          <DesignSystemEventProvider callback={logObservabilityEvent}>
+            <DesignSystemContainer isDarkTheme={isDarkTheme}>
+              <ApplyGlobalStyles />
+              <MlflowThemeGlobalStyles />
+              <DarkThemeProvider setIsDarkTheme={setIsDarkTheme}>
+                <QueryClientProvider client={queryClient}>
+                  <ServerInfoProvider>
+                    <MlflowRouter />
+                  </ServerInfoProvider>
+                </QueryClientProvider>
+              </DarkThemeProvider>
+            </DesignSystemContainer>
+          </DesignSystemEventProvider>
+        </Provider>
+      </RawIntlProvider>
+    </ApolloProvider>
   );
 }

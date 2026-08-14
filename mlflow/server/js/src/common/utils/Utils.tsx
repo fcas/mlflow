@@ -5,25 +5,21 @@
  * annotations are already looking good, please remove this comment.
  */
 
-// @ts-expect-error TS(7016): Could not find a declaration file for module 'date... Remove this comment to see the full error message
-import dateFormat from 'dateformat';
 import React from 'react';
-import notebookSvg from '../static/notebook.svg';
-import revisionSvg from '../static/revision.svg';
-import emptySvg from '../static/empty.svg';
-import laptopSvg from '../static/laptop.svg';
-import projectSvg from '../static/project.svg';
-import workflowsIconSvg from '../static/WorkflowsIcon.svg';
+import moment from 'moment';
 import qs from 'qs';
 import { MLFLOW_INTERNAL_PREFIX } from './TagUtils';
-import _ from 'lodash';
+import { flatMap as lodashFlatMap, merge, omit, sortBy, spread, uniq, uniqWith, groupBy } from 'lodash';
 import { ErrorCodes, SupportPageUrl } from '../constants';
+import type { IntlShape } from 'react-intl';
 import { FormattedMessage } from 'react-intl';
 import { ErrorWrapper } from './ErrorWrapper';
-import { shouldUsePathRouting } from './FeatureUtils';
-import { KeyValueEntity } from '../../experiment-tracking/types';
-import { FileCodeIcon, FolderBranchIcon, NotebookIcon, WorkflowsIcon } from '@databricks/design-system';
+import { NetworkRequestError } from '@databricks/web-shared/errors';
+import type { RunInfoEntity } from '../../experiment-tracking/types';
+import type { KeyValueEntity } from '../types';
+import { NOTE_CONTENT_TAG } from '../../experiment-tracking/utils/NoteUtils';
 
+// eslint-disable-next-line @typescript-eslint/no-extraneous-class -- TODO(FEINF-4274)
 class Utils {
   /**
    * Merge a runs parameters / metrics.
@@ -64,11 +60,23 @@ class Utils {
   /**
    * Displays the error notification in the UI.
    */
-  static displayGlobalErrorNotification(content: any, duration: any) {
+  static displayGlobalErrorNotification(content: any, duration?: any) {
     if (!Utils.#notificationsApi) {
       return;
     }
     (Utils.#notificationsApi as any).error({ message: content, duration: duration });
+  }
+
+  /**
+   * Displays the info notification in the UI. `style` is forwarded to the
+   * underlying notification (e.g. to widen it past the default fixed width so
+   * single-line content doesn't wrap).
+   */
+  static displayGlobalInfoNotification(content: any, duration?: any, style?: any) {
+    if (!Utils.#notificationsApi) {
+      return;
+    }
+    (Utils.#notificationsApi as any).info({ message: content, duration: duration, style: style });
   }
 
   static runNameTag = 'mlflow.runName';
@@ -126,13 +134,22 @@ class Utils {
   /**
    * Format timestamps from millisecond epoch time.
    */
-  static formatTimestamp(timestamp: any, format = 'yyyy-mm-dd HH:MM:ss') {
-    if (timestamp === undefined) {
-      return '(unknown)';
-    }
+  static formatTimestamp(timestamp: any, intl?: IntlShape) {
     const d = new Date(0);
     d.setUTCMilliseconds(timestamp);
-    return dateFormat(d, format);
+
+    // Need to update here when the original shared code is updated: https://github.com/databricks-eng/universe/blob/master/js/packages/web-shared/src/date-time/DateTimeFormats.ts#L37
+    if (intl) {
+      return intl.formatDate(d, {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+    }
+    return moment(d).format('YYYY-MM-DD HH:mm:ss');
   }
 
   static timeSinceStr(date: any, referenceDate = new Date()) {
@@ -223,8 +240,11 @@ class Utils {
    * @param startTime in milliseconds
    * @param endTime in milliseconds
    */
-  static getDuration(startTime: any, endTime: any) {
-    return startTime && endTime ? Utils.formatDuration(endTime - startTime) : null;
+  static getDuration(startTime?: number | string | null, endTime?: number | string | null) {
+    if (!Number(startTime) || !Number(endTime)) {
+      return null;
+    }
+    return Utils.formatDuration(Number(endTime) - Number(startTime));
   }
 
   static baseName(path: any) {
@@ -386,7 +406,7 @@ class Utils {
     const urlSearchParams = new URLSearchParams(currentQueryParams);
     Object.entries(newQueryParams).forEach(
       // @ts-expect-error TS(2345): Argument of type 'unknown' is not assignable to pa... Remove this comment to see the full error message
-      ([key, value]) => !!key && !!value && urlSearchParams.set(key, value),
+      ([key, value]) => Boolean(key) && Boolean(value) && urlSearchParams.set(key, value),
     );
     const queryParams = urlSearchParams.toString();
     if (queryParams !== '' && !queryParams.includes('?')) {
@@ -477,8 +497,8 @@ class Utils {
     revisionId: any,
     runUuid: any,
     sourceName: any,
-    workspaceUrl = null,
-    nameOverride = null,
+    workspaceUrl: string | null = null,
+    nameOverride: string | null = null,
   ) {
     // sourceName may not be present when rendering feature table notebook consumers from remote
     // workspaces or when notebook fetcher failed to fetch the sourceName. Always provide a default
@@ -490,20 +510,28 @@ class Utils {
 
     if (notebookId) {
       const url = Utils.getNotebookSourceUrl(queryParams, notebookId, revisionId, runUuid, workspaceUrl);
+      if (!url) {
+        return name;
+      }
       return (
         <a title={sourceName || Utils.getDefaultNotebookRevisionName(notebookId, revisionId)} href={url} target="_top">
           {name}
         </a>
       );
-    } else {
-      return name;
     }
+    return name;
   }
 
   /**
    * Returns the URL for the notebook source.
    */
-  static getNotebookSourceUrl(queryParams: any, notebookId: any, revisionId: any, runUuid: any, workspaceUrl = null) {
+  static getNotebookSourceUrl(
+    queryParams: any,
+    notebookId: any,
+    revisionId: any,
+    runUuid: any,
+    workspaceUrl: string | null = null,
+  ) {
     let url = Utils.setQueryParams(workspaceUrl || window.location.origin, queryParams);
     url += `#notebook/${notebookId}`;
     if (revisionId) {
@@ -512,7 +540,7 @@ class Utils {
         url += `/mlflow/run/${runUuid}`;
       }
     }
-    return url;
+    return Utils.isValidHttpUrl(url) ? url : '';
   }
 
   /**
@@ -523,8 +551,8 @@ class Utils {
     jobId: any,
     jobRunId: any,
     jobName: any,
-    workspaceUrl = null,
-    nameOverride = null,
+    workspaceUrl: string | null = null,
+    nameOverride: string | null = null,
   ) {
     // jobName may not be present when rendering feature table job consumers from remote
     // workspaces or when getJob API failed to fetch the jobName. Always provide a default
@@ -534,78 +562,28 @@ class Utils {
 
     if (jobId) {
       const url = Utils.getJobSourceUrl(queryParams, jobId, jobRunId, workspaceUrl);
+      if (!url) {
+        return name;
+      }
       return (
         <a title={reformatJobName} href={url} target="_top">
           {name}
         </a>
       );
-    } else {
-      return name;
     }
+    return name;
   }
 
   /**
    * Returns the URL for the job source.
    */
-  static getJobSourceUrl(queryParams: any, jobId: any, jobRunId: any, workspaceUrl = null) {
+  static getJobSourceUrl(queryParams: any, jobId: any, jobRunId: any, workspaceUrl: string | null = null) {
     let url = Utils.setQueryParams(workspaceUrl || window.location.origin, queryParams);
     url += `#job/${jobId}`;
     if (jobRunId) {
       url += `/run/${jobRunId}`;
     }
-    return url;
-  }
-
-  /**
-   * Returns an svg with some styling applied.
-   */
-  static renderSourceTypeIcon(tags: any) {
-    const imageStyle = {
-      height: '20px',
-      marginRight: '4px',
-    };
-
-    const sourceType = Utils.getSourceType(tags);
-    if (sourceType === 'NOTEBOOK') {
-      if (Utils.getNotebookRevisionId(tags)) {
-        return <img alt="Notebook Revision Icon" title="Notebook Revision" style={imageStyle} src={revisionSvg} />;
-      } else {
-        return <img alt="Notebook Icon" title="Notebook" style={imageStyle} src={notebookSvg} />;
-      }
-    } else if (sourceType === 'LOCAL') {
-      return <img alt="Local Source Icon" title="Local Source" style={imageStyle} src={laptopSvg} />;
-    } else if (sourceType === 'PROJECT') {
-      return <img alt="Project Icon" title="Project" style={imageStyle} src={projectSvg} />;
-    } else if (sourceType === 'JOB') {
-      return <img alt="Job Icon" title="Job" style={imageStyle} src={workflowsIconSvg} />;
-    }
-    return <img alt="No icon" style={imageStyle} src={emptySvg} />;
-  }
-
-  // New version of renderSourceTypeIcon that uses icons from design system
-  static renderSourceTypeIconV2(tags: any) {
-    const sourceType = Utils.getSourceType(tags);
-
-    if (sourceType === 'NOTEBOOK') {
-      return <NotebookIcon />;
-    } else if (sourceType === 'LOCAL') {
-      // TODO: missing icon for local source
-      return (
-        <img
-          alt="Local Source Icon"
-          title="Local Source"
-          css={{
-            width: 16,
-          }}
-          src={laptopSvg}
-        />
-      );
-    } else if (sourceType === 'PROJECT') {
-      return <FolderBranchIcon />;
-    } else if (sourceType === 'JOB') {
-      return <WorkflowsIcon />;
-    }
-    return null;
+    return Utils.isValidHttpUrl(url) ? url : '';
   }
 
   /**
@@ -653,14 +631,22 @@ class Utils {
     return Utils.getRunName(runInfo) || 'Run ' + runUuid;
   }
 
-  static getRunName(runInfo: any) {
-    return runInfo.run_name || '';
+  static getRunName(runInfo?: RunInfoEntity) {
+    return runInfo?.runName || '';
   }
 
   static getRunNameFromTags(runTags: any) {
     const runNameTag = runTags[Utils.runNameTag];
     if (runNameTag) {
       return runNameTag.value;
+    }
+    return '';
+  }
+
+  static getRunDescriptionFromTags(runTags: any) {
+    const runDescriptionTag = runTags?.[NOTE_CONTENT_TAG];
+    if (runDescriptionTag) {
+      return runDescriptionTag.value;
     }
     return '';
   }
@@ -898,15 +884,15 @@ class Utils {
     return stepResult === 0 ? history1.timestamp - history2.timestamp : stepResult;
   }
 
-  static getVisibleTagValues(tags: any) {
+  static getVisibleTagValues(tags: Record<string, KeyValueEntity>) {
     // Collate tag objects into list of [key, value] lists and filter MLflow-internal tags
     return Object.values(tags)
-      .map((t) => [(t as any).key || (t as any).getKey(), (t as any).value || (t as any).getValue()])
+      .map((t) => [t.key, t.value])
       .filter((t) => !t[0].startsWith(MLFLOW_INTERNAL_PREFIX));
   }
 
   static getVisibleTagKeyList(tagsList: any) {
-    return _.uniq(_.flatMap(tagsList, (tags) => Utils.getVisibleTagValues(tags).map(([key]) => key)));
+    return uniq(lodashFlatMap(tagsList, (tags) => Utils.getVisibleTagValues(tags).map(([key]) => key)));
   }
 
   /**
@@ -918,13 +904,11 @@ class Utils {
    * From https://stackoverflow.com/a/38506572/13837474
    */
   static concatAndGroupArraysById(array: any, arrayToConcat: any, id: any) {
+    const groupedArrays = groupBy(array.concat(arrayToConcat), id);
     return (
-      _(array)
-        .concat(arrayToConcat)
-        .groupBy(id)
+      Object.values(groupedArrays)
         // complication of _.merge necessary to avoid mutating arguments
-        .map(_.spread((obj, source) => _.merge({}, obj, source)))
-        .value()
+        .map(spread((obj, source) => merge({}, obj, source)))
     );
   }
 
@@ -942,12 +926,21 @@ class Utils {
   }[] {
     const modelsTag = tags[Utils.loggedModelsTag];
     if (modelsTag) {
-      const models = JSON.parse(modelsTag.value);
+      let models = null;
+      try {
+        models = JSON.parse(modelsTag.value);
+      } catch (e) {
+        // TODO: for now, we ignore parsing errors to prevent
+        // crashing the page. However, we should come up with
+        // a better solution (e.g. keep only the last X entries
+        // to prevent exceeding tag value limits).
+        // See https://github.com/mlflow/mlflow/issues/12032
+      }
       if (models) {
         // extract artifact path, flavors and creation time from tag.
         // 'python_function' should be interpreted as pyfunc flavor
         const filtered = models.map((model: any) => {
-          const removeFunc = Object.keys(_.omit(model.flavors, 'python_function'));
+          const removeFunc = Object.keys(omit(model.flavors, 'python_function'));
           const flavors = removeFunc.length ? removeFunc : ['pyfunc'];
           return {
             artifactPath: model.artifact_path,
@@ -957,7 +950,7 @@ class Utils {
         });
         // sort in descending order of creation time
         const sorted = filtered.sort((a: any, b: any) => parseFloat(b.utcTimeCreated) - parseFloat(a.utcTimeCreated));
-        return _.uniqWith(sorted, (a, b) => (a as any).artifactPath === (b as any).artifactPath);
+        return uniqWith(sorted, (a, b) => (a as any).artifactPath === (b as any).artifactPath);
       }
     }
     return [];
@@ -991,30 +984,19 @@ class Utils {
       'artifactPath',
     );
     return models.sort((a, b) => {
-      // @ts-expect-error TODO: fix this
       if (a.registeredModelVersion && b.registeredModelVersion) {
-        // @ts-expect-error TODO: fix this
         if (a.flavors && !b.flavors) {
           return -1;
-          // @ts-expect-error TODO: fix this
         } else if (!a.flavors && b.flavors) {
           return 1;
         } else {
-          return (
-            // @ts-expect-error TODO: fix this
-            parseInt(b.registeredModelCreationTimestamp, 10) -
-            // @ts-expect-error TODO: fix this
-            parseInt(a.registeredModelCreationTimestamp, 10)
-          );
+          return parseInt(b.registeredModelCreationTimestamp, 10) - parseInt(a.registeredModelCreationTimestamp, 10);
         }
-        // @ts-expect-error TODO: fix this
       } else if (a.registeredModelVersion && !b.registeredModelVersion) {
         return -1;
-        // @ts-expect-error TODO: fix this
       } else if (!a.registeredModelVersion && b.registeredModelVersion) {
         return 1;
       }
-      // @ts-expect-error TODO: fix this
       return b.utcTimeCreated - a.utcTimeCreated;
     });
   }
@@ -1026,12 +1008,13 @@ class Utils {
     duration = 3,
     passErrorToParentFrame = false,
   ) {
-    console.error(e);
     if (typeof e === 'string') {
       Utils.displayGlobalErrorNotification(e, duration);
     } else if (e instanceof ErrorWrapper) {
       // not all error is wrapped by ErrorWrapper
       Utils.displayGlobalErrorNotification(e.renderHttpError(), duration);
+    } else if (e instanceof NetworkRequestError) {
+      Utils.displayGlobalErrorNotification(e.displayMessage, duration);
       // eslint-disable-next-line no-empty
     } else {
     }
@@ -1062,15 +1045,15 @@ class Utils {
   }
 
   static sortExperimentsById = (experiments: any) => {
-    return _.sortBy(experiments, [({ experiment_id }) => experiment_id]);
+    return sortBy(experiments, [({ experimentId }) => experimentId]);
   };
 
   static getExperimentNameMap = (experiments: any) => {
     // Input:
     // [
-    //  { experiment_id: 1, name: '/1/bar' },
-    //  { experiment_id: 2, name: '/2/foo' },
-    //  { experiment_id: 3, name: '/3/bar' },
+    //  { experimentId: 1, name: '/1/bar' },
+    //  { experimentId: 2, name: '/2/foo' },
+    //  { experimentId: 3, name: '/3/bar' },
     // ]
     //
     // Output:
@@ -1090,9 +1073,9 @@ class Utils {
     const idToNames = {};
     Object.entries(experimentsByBasename).forEach(([basename, exps]) => {
       const isUnique = (exps as any).length === 1;
-      (exps as any).forEach(({ experiment_id, name }: any, index: any) => {
+      (exps as any).forEach(({ experimentId, name }: any, index: any) => {
         // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-        idToNames[experiment_id] = {
+        idToNames[experimentId] = {
           name,
           basename: isUnique ? basename : `${basename} (${index + 1})`,
         };
@@ -1140,8 +1123,8 @@ class Utils {
   }
 
   static compareExperiments(a: any, b: any) {
-    const aId = typeof a.getExperimentId === 'function' ? a.getExperimentId() : a.experiment_id;
-    const bId = typeof b.getExperimentId === 'function' ? b.getExperimentId() : b.experiment_id;
+    const aId = a.experimentId;
+    const bId = b.experimentId;
 
     const aIntId = parseInt(aId, 10);
     const bIntId = parseInt(bId, 10);
@@ -1170,20 +1153,6 @@ class Utils {
     }
 
     return false;
-  }
-
-  static getIframeCorrectedRoute(route: any) {
-    if (shouldUsePathRouting()) {
-      // After enabling path routing, we don't need any hash splitting etc.
-      return route;
-    }
-    if (Utils.isUsingExternalRouter()) {
-      // If using external routing, include the parent params and assume mlflow served at #
-      const parentHref = window.parent.location.href;
-      const parentHrefBeforeMlflowHash = parentHref.split('#')[0];
-      return `${parentHrefBeforeMlflowHash}#mlflow${route}`;
-    }
-    return `./#${route}`; // issue-2213 use relative path in case there is a url prefix
   }
 
   static isValidHttpUrl(str: any) {

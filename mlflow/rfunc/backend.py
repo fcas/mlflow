@@ -7,7 +7,6 @@ import sys
 from mlflow.exceptions import MlflowException
 from mlflow.models import FlavorBackend
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
-from mlflow.utils.string_utils import quote
 
 _logger = logging.getLogger(__name__)
 
@@ -18,18 +17,38 @@ class RFuncBackend(FlavorBackend):
     Predict and serve locally models with 'crate' flavor.
     """
 
-    def build_image(self, model_uri, image_name, install_mlflow, mlflow_home, enable_mlserver):
+    def build_image(
+        self,
+        model_uri,
+        image_name,
+        install_java=False,
+        install_mlflow=False,
+        mlflow_home=None,
+        base_image=None,
+    ):
         pass
 
     def generate_dockerfile(
-        self, model_uri, output_path, install_mlflow, mlflow_home, enable_mlserver
+        self,
+        model_uri,
+        output_dir,
+        install_java=False,
+        install_mlflow=False,
+        mlflow_home=None,
+        base_image=None,
     ):
         pass
 
     version_pattern = re.compile(r"version ([0-9]+\.[0-9]+\.[0-9]+)")
 
     def predict(
-        self, model_uri, input_path, output_path, content_type, pip_requirements_override=None
+        self,
+        model_uri,
+        input_path,
+        output_path,
+        content_type,
+        pip_requirements_override=None,
+        extra_envs=None,
     ):
         """
         Generate predictions using R model saved with MLflow.
@@ -39,16 +58,16 @@ class RFuncBackend(FlavorBackend):
             raise MlflowException("pip_requirements_override is not supported in the R backend.")
         model_path = _download_artifact_from_uri(model_uri)
         str_cmd = (
-            "mlflow:::mlflow_rfunc_predict(model_path = '{0}', input_path = {1}, "
+            "mlflow:::mlflow_rfunc_predict(model_path = {0}, input_path = {1}, "
             "output_path = {2}, content_type = {3})"
         )
         command = str_cmd.format(
-            quote(model_path),
+            _r_quote(model_path),
             _str_optional(input_path),
             _str_optional(output_path),
             _str_optional(content_type),
         )
-        _execute(command)
+        _execute(command, extra_envs=extra_envs)
 
     def serve(
         self,
@@ -56,21 +75,13 @@ class RFuncBackend(FlavorBackend):
         port,
         host,
         timeout,
-        enable_mlserver,
         synchronous=True,
         stdout=None,
         stderr=None,
     ):
         """
         Generate R model locally.
-
-        NOTE: The `enable_mlserver` parameter is there to comply with the
-        FlavorBackend interface but is not supported by MLServer yet.
-        https://github.com/SeldonIO/MLServer/issues/183
         """
-        if enable_mlserver:
-            raise Exception("The MLServer inference server is not yet supported in the R backend.")
-
         if timeout:
             _logger.warning("Timeout is not yet supported in the R backend.")
 
@@ -81,8 +92,8 @@ class RFuncBackend(FlavorBackend):
             raise Exception("RBackend does not support redirect stdout/stderr.")
 
         model_path = _download_artifact_from_uri(model_uri)
-        command = "mlflow::mlflow_rfunc_serve('{}', port = {}, host = '{}')".format(
-            quote(model_path), port, host
+        command = "mlflow::mlflow_rfunc_serve({}, port = {}, host = {})".format(
+            _r_quote(model_path), port, _r_quote(host)
         )
         _execute(command)
 
@@ -105,8 +116,10 @@ class RFuncBackend(FlavorBackend):
         return version[0] > 3 or version[0] == 3 and version[1] >= 3
 
 
-def _execute(command):
+def _execute(command, extra_envs=None):
     env = os.environ.copy()
+    if extra_envs:
+        env.update(extra_envs)
 
     process = subprocess.Popen(
         ["Rscript", "-e", command],
@@ -121,4 +134,12 @@ def _execute(command):
 
 
 def _str_optional(s):
-    return "NULL" if s is None else f"'{quote(str(s))}'"
+    return "NULL" if s is None else _r_quote(str(s))
+
+
+def _r_quote(s: str) -> str:
+    # The `command` is passed directly as an argv element to `Rscript -e`, so
+    # the string is parsed by R, not the shell. Escape backslashes and single
+    # quotes so the result is a safe R single-quoted string literal.
+    escaped = s.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"

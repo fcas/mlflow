@@ -4,13 +4,13 @@ import {
   OverflowIcon,
   PlayIcon,
   StopIcon,
-  Tooltip,
   VisibleIcon,
   useDesignSystemTheme,
+  Tooltip,
 } from '@databricks/design-system';
 import { Link } from '../../../../common/utils/RoutingUtils';
 import ExperimentRoutes from '../../../routes';
-import { RunRowType } from '../../experiment-page/utils/experimentPage.row-types';
+import type { RunRowType } from '../../experiment-page/utils/experimentPage.row-types';
 import { EvaluationRunHeaderModelIndicator } from './EvaluationRunHeaderModelIndicator';
 import { shouldEnablePromptLab } from '../../../../common/utils/FeatureUtils';
 import { EvaluationRunHeaderDatasetIndicator } from './EvaluationRunHeaderDatasetIndicator';
@@ -19,8 +19,9 @@ import { usePromptEngineeringContext } from '../contexts/PromptEngineeringContex
 import { FormattedMessage, useIntl } from 'react-intl';
 import React, { useMemo } from 'react';
 import { EvaluationTableHeader } from './EvaluationTableHeader';
-import { useCreateNewRun } from '../../experiment-page/hooks/useCreateNewRun';
 import { canEvaluateOnRun } from '../../prompt-engineering/PromptEngineering.utils';
+import { useGetExperimentRunColor } from '../../experiment-page/hooks/useExperimentRunColor';
+import { RunColorPill } from '../../experiment-page/components/RunColorPill';
 
 interface EvaluationRunHeaderCellRendererProps {
   run: RunRowType;
@@ -45,6 +46,7 @@ export const EvaluationRunHeaderCellRenderer = ({
     usePromptEngineeringContext();
   const intl = useIntl();
   const evaluableRowCount = getEvaluableRowCount(run);
+  const getRunColor = useGetExperimentRunColor();
   const evaluateAllButtonEnabled = evaluableRowCount > 0;
 
   const evaluatingAllInProgress = runColumnsBeingEvaluated.includes(run.runUuid);
@@ -91,35 +93,30 @@ export const EvaluationRunHeaderCellRenderer = ({
           display: 'flex',
         }}
       >
-        <Link
-          css={{ display: 'flex', gap: theme.spacing.sm, alignItems: 'center' }}
-          to={ExperimentRoutes.getRunPageRoute(run.experimentId || '', run.runUuid)}
-          target="_blank"
-        >
-          <div
-            css={{
-              backgroundColor: run.color,
-              width: 12,
-              height: 12,
-              borderRadius: 6,
-            }}
-          />
-
-          {run.runName}
-        </Link>
-        <div css={{ flexBasis: theme.spacing.sm }} />
+        <span css={{ display: 'flex', gap: theme.spacing.sm, alignItems: 'center' }}>
+          <RunColorPill color={getRunColor(run.runUuid)} />
+          <Link
+            componentId="mlflow.experiment_tracking.evaluation.run_header_link"
+            to={ExperimentRoutes.getRunPageRoute(run.experimentId || '', run.runUuid)}
+            target="_blank"
+          >
+            {run.runName}
+          </Link>
+        </span>
+        <div css={{ flexBasis: theme.spacing.sm, flexShrink: 0 }} />
 
         <Button
           componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_components_evaluationrunheadercellrenderer.tsx_112"
           onClick={() => onHideRun(run.runUuid)}
           size="small"
           icon={<VisibleIcon />}
+          css={{ flexShrink: 0 }}
         />
         <div css={{ flex: 1 }} />
         {shouldEnablePromptLab() && canEvaluateInRunColumn(run) && (
           <>
             <div css={{ flexBasis: theme.spacing.sm }} />
-            <Tooltip title={evaluateAllTooltipContent}>
+            <Tooltip componentId="mlflow.run.artifact_view.evaluate_all.tooltip" content={evaluateAllTooltipContent}>
               <Button
                 componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_components_evaluationrunheadercellrenderer.tsx_118"
                 disabled={!evaluateAllButtonEnabled}
@@ -153,7 +150,10 @@ export const EvaluationRunHeaderCellRenderer = ({
               />
             </DropdownMenu.Trigger>
             <DropdownMenu.Content>
-              <DropdownMenu.Item onClick={() => onDuplicateRun(run)}>
+              <DropdownMenu.Item
+                componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_components_evaluationrunheadercellrenderer.tsx_150"
+                onClick={() => onDuplicateRun(run)}
+              >
                 <FormattedMessage
                   defaultMessage="Duplicate run"
                   description='Experiment page > artifact compare view > run column header > "duplicate run" button label'

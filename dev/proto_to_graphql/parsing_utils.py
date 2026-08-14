@@ -26,6 +26,7 @@ def process_method(method_descriptor, state):
             state.queries.add(method_descriptor)
         else:
             state.mutations.add(method_descriptor)
+        state.outputs.add(method_descriptor.output_type)
         populate_message_types(method_descriptor.input_type, state, True, set())
         populate_message_types(method_descriptor.output_type, state, False, set())
 
@@ -46,7 +47,7 @@ def populate_message_types(field_descriptor, state, is_input, visited):
 
     for sub_field in field_descriptor.fields:
         type = sub_field.type
-        if type == FieldDescriptor.TYPE_MESSAGE or type == FieldDescriptor.TYPE_GROUP:
+        if type in (FieldDescriptor.TYPE_MESSAGE, FieldDescriptor.TYPE_GROUP):
             populate_message_types(sub_field.message_type, state, is_input, visited)
         elif type == FieldDescriptor.TYPE_ENUM:
             state.enums.add(sub_field.enum_type)

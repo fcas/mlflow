@@ -1,14 +1,19 @@
 import type { RunsChartAxisDef, RunsChartsRunData } from './components/RunsCharts.common';
 import { RunsChartsLineChartXAxisType } from './components/RunsCharts.common';
 import { getUUID } from '../../../common/utils/ActionUtils';
-import { MetricEntitiesByName, ChartSectionConfig } from '../../types';
+import type { ChartSectionConfig } from '../../types';
+import { MetricEntitiesByName } from '../../types';
 import {
   MLFLOW_MODEL_METRIC_PREFIX,
   MLFLOW_SYSTEM_METRIC_PREFIX,
   MLFLOW_MODEL_METRIC_NAME,
   MLFLOW_SYSTEM_METRIC_NAME,
+  DEFAULT_IMAGE_GRID_CHART_NAME,
 } from '../../constants';
-import { isNil, uniq } from 'lodash';
+import { isEmpty, isEqual, isNil, uniq } from 'lodash';
+import { customMetricBehaviorDefs } from '../experiment-page/utils/customMetricBehaviorUtils';
+import type { useCategorizedNodeLevelMetricKeys } from '../run-page/node-level-metric-charts/hooks/useCategorizedNodeLevelMetricKeys';
+import { createNodeLevelMetricKey } from '../run-page/node-level-metric-charts/node-level-metric-charts.utils';
 
 /**
  * Enum for all recognized chart types used in runs charts
@@ -19,9 +24,14 @@ export enum RunsChartType {
   SCATTER = 'SCATTER',
   CONTOUR = 'CONTOUR',
   PARALLEL = 'PARALLEL',
+  DIFFERENCE = 'DIFFERENCE',
+  IMAGE = 'IMAGE',
 }
 
 const MIN_NUMBER_OF_STEP_FOR_LINE_COMPARISON = 1;
+
+const NODE_SYSTEM_METRICS_SECTION_NAME = 'Node system metrics';
+const GPU_SYSTEM_METRICS_SECTION_NAME = 'GPU system metrics';
 
 /**
  * Simple interface corresponding to `RunsChartsCardConfig`.
@@ -46,6 +56,9 @@ export abstract class RunsChartsCardConfig {
   metricSectionId?: string = '';
   deleted = false;
   isGenerated = false;
+
+  // Custom title of the chart. If not provided, it's inferred from configuration (e.g. metric key).
+  displayName?: string;
 
   constructor(isGenerated: boolean, uuid?: string, metricSectionId?: string) {
     this.isGenerated = isGenerated;
@@ -78,6 +91,10 @@ export abstract class RunsChartsCardConfig {
       return new RunsChartsParallelCardConfig(isGenerated, uuid, metricSectionId);
     } else if (type === RunsChartType.LINE) {
       return new RunsChartsLineCardConfig(isGenerated, uuid, metricSectionId);
+    } else if (type === RunsChartType.DIFFERENCE) {
+      return new RunsChartsDifferenceCardConfig(isGenerated, uuid, metricSectionId);
+    } else if (type === RunsChartType.IMAGE) {
+      return new RunsChartsImageCardConfig(isGenerated, uuid, metricSectionId);
     } else {
       // Must be contour
       return new RunsChartsContourCardConfig(isGenerated, uuid, metricSectionId);
@@ -115,6 +132,7 @@ export abstract class RunsChartsCardConfig {
       resultChartSet.push({
         ...RunsChartsCardConfig.getEmptyChartCardByType(chartType, true, getUUID()),
         metricKey: metricsKey,
+        displayName: RunsChartsCardConfig.extractChartDisplayName(metricsKey),
       } as RunsChartsBarCardConfig);
     });
 
@@ -128,7 +146,9 @@ export abstract class RunsChartsCardConfig {
 
   // Extract chart section from metric key
   static extractChartSectionName = (metricKey: string, delimiter = '/') => {
-    const parts = metricKey.split(delimiter);
+    const displayMetricName = customMetricBehaviorDefs[metricKey]?.displayName ?? metricKey;
+
+    const parts = displayMetricName.split(delimiter);
     const section = parts.slice(0, -1).join(delimiter);
     if (section === MLFLOW_MODEL_METRIC_PREFIX) {
       return MLFLOW_MODEL_METRIC_NAME;
@@ -138,18 +158,36 @@ export abstract class RunsChartsCardConfig {
     return section;
   };
 
+  static extractChartDisplayName = (metricKey: string, delimiter = '/') => {
+    const displayMetricName = customMetricBehaviorDefs[metricKey]?.displayName ?? metricKey;
+    const parts = displayMetricName.split(delimiter);
+    return parts[parts.length - 1] || displayMetricName;
+  };
+
+  static getDisplayNameForUpdatedMetricSelection = (
+    config: RunsChartsBarCardConfig | RunsChartsLineCardConfig,
+    updatedMetricKeys: string[],
+  ) => {
+    const currentMetricKeys = config.selectedMetricKeys ?? [
+      config.type === RunsChartType.BAR ? (config.dataAccessKey ?? config.metricKey) : config.metricKey,
+    ];
+    return isEqual(currentMetricKeys, updatedMetricKeys) ? config.displayName : undefined;
+  };
+
   static getBaseChartAndSectionConfigs({
     primaryMetricKey,
     runsData,
     useParallelCoordinatesChart = false,
     enabledSectionNames = [MLFLOW_MODEL_METRIC_NAME, MLFLOW_SYSTEM_METRIC_NAME],
     filterMetricNames,
+    nodeLevelMetricsConfig,
   }: {
     primaryMetricKey?: string;
     useParallelCoordinatesChart?: boolean;
     runsData: RunsChartsRunData[];
     enabledSectionNames?: string[];
     filterMetricNames?: (metricName: string) => boolean;
+    nodeLevelMetricsConfig?: ReturnType<typeof useCategorizedNodeLevelMetricKeys>;
   }) {
     const resultChartSet: RunsChartsCardConfig[] = [];
 
@@ -166,6 +204,8 @@ export abstract class RunsChartsCardConfig {
       metricsToRender.add(primaryMetricKey);
     }
 
+    const imagesToRender = uniq(runsData.flatMap((run) => Object.keys(run.images)));
+
     // Adding other metrics to render
     for (const metricsKey of allMetricKeys) {
       metricsToRender.add(metricsKey);
@@ -176,9 +216,63 @@ export abstract class RunsChartsCardConfig {
       sectionName2Uuid[sectionName] = getUUID();
     });
 
-    metricsToRender.forEach((metricsKey) => {
-      if (!sectionName2Uuid[RunsChartsCardConfig.extractChartSectionName(metricsKey)]) {
-        sectionName2Uuid[RunsChartsCardConfig.extractChartSectionName(metricsKey)] = getUUID();
+    if (nodeLevelMetricsConfig?.enabled) {
+      // Remove all node-level keys so we never create per-node sections (e.g. "system/node_0")
+      // from extractChartSectionName; only commonMetrics/commonGpuMetrics get node-level charts.
+      for (const key of Array.from(metricsToRender)) {
+        if (key.startsWith(`${MLFLOW_SYSTEM_METRIC_PREFIX}node_`)) {
+          metricsToRender.delete(key);
+        }
+      }
+      if (!isEmpty(nodeLevelMetricsConfig?.commonMetrics)) {
+        sectionName2Uuid[NODE_SYSTEM_METRICS_SECTION_NAME] = getUUID();
+      }
+      if (!isEmpty(nodeLevelMetricsConfig?.commonGpuMetrics)) {
+        sectionName2Uuid[GPU_SYSTEM_METRICS_SECTION_NAME] = getUUID();
+      }
+      nodeLevelMetricsConfig?.commonMetrics.forEach((metric) => {
+        const lineChart = new RunsChartsLineCardConfig(
+          true,
+          getUUID(),
+          sectionName2Uuid[NODE_SYSTEM_METRICS_SECTION_NAME],
+        );
+        lineChart.displayName = metric;
+        lineChart.selectedMetricKeys = [];
+        for (const node of nodeLevelMetricsConfig?.nodeIndexes) {
+          const fullMetricKey = createNodeLevelMetricKey(node, metric);
+          lineChart.selectedMetricKeys.push(fullMetricKey);
+        }
+        lineChart.nodeLevelSystemMetricConfiguration = {
+          metric,
+          type: 'node',
+        };
+        resultChartSet.push(lineChart);
+      });
+      nodeLevelMetricsConfig?.commonGpuMetrics.forEach((metric) => {
+        const lineChart = new RunsChartsLineCardConfig(
+          true,
+          getUUID(),
+          sectionName2Uuid[GPU_SYSTEM_METRICS_SECTION_NAME],
+        );
+        lineChart.displayName = metric;
+        lineChart.selectedMetricKeys = [];
+        for (const node of nodeLevelMetricsConfig?.nodeIndexes) {
+          for (const gpuIndex of nodeLevelMetricsConfig?.gpuIndexes) {
+            const fullMetricKey = createNodeLevelMetricKey(node, metric, gpuIndex);
+            lineChart.selectedMetricKeys.push(fullMetricKey);
+          }
+        }
+        lineChart.nodeLevelSystemMetricConfiguration = {
+          metric,
+          type: 'gpu',
+        };
+        resultChartSet.push(lineChart);
+      });
+    }
+
+    [...metricsToRender, ...imagesToRender].forEach((key) => {
+      if (!sectionName2Uuid[RunsChartsCardConfig.extractChartSectionName(key)]) {
+        sectionName2Uuid[RunsChartsCardConfig.extractChartSectionName(key)] = getUUID();
       }
     });
 
@@ -197,7 +291,22 @@ export abstract class RunsChartsCardConfig {
         resultChartSet.push({
           ...RunsChartsCardConfig.getEmptyChartCardByType(chartType, true, getUUID(), sectionId),
           metricKey: metricsKey,
+          displayName: RunsChartsCardConfig.extractChartDisplayName(metricsKey),
+          ...(metricsKey.startsWith(MLFLOW_SYSTEM_METRIC_PREFIX) ? { xAxisKey: 'time', useGlobalXaxisKey: false } : {}),
         } as RunsChartsBarCardConfig);
+      });
+
+    Array.from(imagesToRender)
+      .sort()
+      .forEach((imageKey) => {
+        const chartType = RunsChartType.IMAGE;
+        const sectionId = sectionName2Uuid[RunsChartsCardConfig.extractChartSectionName(imageKey)];
+
+        // Add an image chart
+        resultChartSet.push({
+          ...RunsChartsCardConfig.getEmptyChartCardByType(chartType, true, getUUID(), sectionId),
+          imageKeys: [imageKey],
+        } as RunsChartsImageCardConfig);
       });
 
     // If no other charts exist, show empty parallel coordinates plot
@@ -235,12 +344,14 @@ export abstract class RunsChartsCardConfig {
     isAccordionReordered,
     runsData,
     filterMetricNames,
+    nodeLevelMetricsConfig,
   }: {
     compareRunCharts: RunsChartsCardConfig[];
     compareRunSections: ChartSectionConfig[];
     runsData: RunsChartsRunData[];
     isAccordionReordered: boolean;
     filterMetricNames?: (metricName: string) => boolean;
+    nodeLevelMetricsConfig?: ReturnType<typeof useCategorizedNodeLevelMetricKeys>;
   }) {
     // Make copies of the current charts and sections
     const resultChartSet: RunsChartsCardConfig[] = compareRunCharts.slice();
@@ -255,6 +366,8 @@ export abstract class RunsChartsCardConfig {
       return filterMetricNames(name);
     });
 
+    const imagesToRender = uniq(runsData.flatMap((run) => Object.keys(run.images)));
+
     // Create set of metrics to render based on runsData
     const metricsToRender: Set<string> = new Set();
     // Adding other metrics to render
@@ -265,6 +378,121 @@ export abstract class RunsChartsCardConfig {
     // Create sectionName2Uuid mappings from existing sections
     const sectionName2Uuid: Record<string, string> = {};
     compareRunSections.forEach((section) => (sectionName2Uuid[section.name] = section.uuid));
+
+    if (nodeLevelMetricsConfig?.enabled) {
+      // Remove all node-level keys so we never create per-node sections or bar charts for them.
+      for (const key of Array.from(metricsToRender)) {
+        if (key.startsWith(`${MLFLOW_SYSTEM_METRIC_PREFIX}node_`)) {
+          metricsToRender.delete(key);
+        }
+      }
+      if (!isEmpty(nodeLevelMetricsConfig?.commonMetrics)) {
+        if (!sectionName2Uuid[NODE_SYSTEM_METRICS_SECTION_NAME]) {
+          sectionName2Uuid[NODE_SYSTEM_METRICS_SECTION_NAME] = getUUID();
+        }
+      }
+      if (!isEmpty(nodeLevelMetricsConfig?.commonGpuMetrics)) {
+        if (!sectionName2Uuid[GPU_SYSTEM_METRICS_SECTION_NAME]) {
+          sectionName2Uuid[GPU_SYSTEM_METRICS_SECTION_NAME] = getUUID();
+        }
+      }
+      nodeLevelMetricsConfig?.commonMetrics.forEach((metric) => {
+        const lineCharts = resultChartSet.filter(
+          (chart): chart is RunsChartsLineCardConfig =>
+            chart.type === RunsChartType.LINE &&
+            (chart as RunsChartsLineCardConfig).nodeLevelSystemMetricConfiguration?.metric === metric &&
+            (chart as RunsChartsLineCardConfig).nodeLevelSystemMetricConfiguration?.type === 'node',
+        );
+        if (lineCharts.length > 0) return;
+
+        isResultUpdated = true;
+        const sectionId = sectionName2Uuid[NODE_SYSTEM_METRICS_SECTION_NAME];
+        const lineChart = new RunsChartsLineCardConfig(true, getUUID(), sectionId);
+        lineChart.displayName = metric;
+        lineChart.selectedMetricKeys = Array.from(nodeLevelMetricsConfig?.nodeIndexes ?? [], (node) =>
+          createNodeLevelMetricKey(node, metric),
+        );
+        lineChart.nodeLevelSystemMetricConfiguration = { metric, type: 'node' };
+
+        const sectionChartIndices = resultChartSet
+          .map((c, i) => (c.metricSectionId === sectionId ? i : null))
+          .filter((i): i is number => i !== null);
+        const lastSectionIndex = sectionChartIndices[sectionChartIndices.length - 1];
+        const insertIndex = lastSectionIndex !== undefined ? lastSectionIndex + 1 : resultChartSet.length;
+        resultChartSet.splice(insertIndex, 0, lineChart);
+      });
+      nodeLevelMetricsConfig?.commonGpuMetrics.forEach((metric) => {
+        const lineCharts = resultChartSet.filter(
+          (chart): chart is RunsChartsLineCardConfig =>
+            chart.type === RunsChartType.LINE &&
+            (chart as RunsChartsLineCardConfig).nodeLevelSystemMetricConfiguration?.metric === metric &&
+            (chart as RunsChartsLineCardConfig).nodeLevelSystemMetricConfiguration?.type === 'gpu',
+        );
+        if (lineCharts.length > 0) return;
+
+        isResultUpdated = true;
+        const sectionId = sectionName2Uuid[GPU_SYSTEM_METRICS_SECTION_NAME];
+        const lineChart = new RunsChartsLineCardConfig(true, getUUID(), sectionId);
+        lineChart.displayName = metric;
+        lineChart.selectedMetricKeys = [];
+        for (const node of nodeLevelMetricsConfig?.nodeIndexes ?? []) {
+          for (const gpuIndex of nodeLevelMetricsConfig?.gpuIndexes ?? []) {
+            lineChart.selectedMetricKeys.push(createNodeLevelMetricKey(node, metric, gpuIndex));
+          }
+        }
+        lineChart.nodeLevelSystemMetricConfiguration = { metric, type: 'gpu' };
+
+        const sectionChartIndices = resultChartSet
+          .map((c, i) => (c.metricSectionId === sectionId ? i : null))
+          .filter((i): i is number => i !== null);
+        const lastSectionIndex = sectionChartIndices[sectionChartIndices.length - 1];
+        const insertIndex = lastSectionIndex !== undefined ? lastSectionIndex + 1 : resultChartSet.length;
+        resultChartSet.splice(insertIndex, 0, lineChart);
+      });
+    }
+
+    imagesToRender.forEach((imageKey) => {
+      const doesImageKeyExist =
+        resultChartSet.findIndex((chart) => {
+          const chartImageKeys = (chart as RunsChartsImageCardConfig).imageKeys;
+          return chartImageKeys ? chartImageKeys.length === 1 && chartImageKeys.includes(imageKey) : false;
+        }) >= 0;
+
+      const chartType = RunsChartType.IMAGE;
+      if (!doesImageKeyExist) {
+        // result is updated when there is a new image key
+        isResultUpdated = true;
+
+        // Insert a new UUID if section doesn't exist
+        const sectionName = RunsChartsCardConfig.extractChartSectionName(imageKey);
+        if (!sectionName2Uuid[sectionName]) {
+          sectionName2Uuid[sectionName] = getUUID();
+        }
+
+        // Get section for imageKey and check if it has been reordered
+        const sectionId = sectionName2Uuid[sectionName];
+        // If section is undefined, it may be a new section, so its not reordered
+        const section = resultSectionSet.find((section) => section.uuid === sectionId);
+        const isSectionReordered = section ? section.isReordered : false;
+
+        const newChartConfig = {
+          ...RunsChartsCardConfig.getEmptyChartCardByType(chartType, true, getUUID(), sectionId),
+          imageKeys: [imageKey],
+        } as RunsChartsImageCardConfig;
+
+        if (isSectionReordered) {
+          // If the section has been reordered, then append to the end of the section
+          resultChartSet.push(newChartConfig);
+        } else {
+          // If section has not been reordered, then insert alphabetically
+          const insertIndex = resultChartSet.findIndex((chart) => {
+            const chartImageKeys = (chart as RunsChartsImageCardConfig).imageKeys;
+            return chartImageKeys ? chartImageKeys[0]?.localeCompare(imageKey) >= 0 : false;
+          });
+          resultChartSet.splice(insertIndex, 0, newChartConfig);
+        }
+      }
+    });
 
     // Append new charts at the end instead of alphabetically
     metricsToRender.forEach((metricKey) => {
@@ -307,6 +535,8 @@ export abstract class RunsChartsCardConfig {
         const newChartConfig = {
           ...RunsChartsCardConfig.getEmptyChartCardByType(chartType, true, getUUID(), sectionId),
           metricKey: metricKey,
+          displayName: RunsChartsCardConfig.extractChartDisplayName(metricKey),
+          ...(metricKey.startsWith(MLFLOW_SYSTEM_METRIC_PREFIX) ? { xAxisKey: 'time', useGlobalXaxisKey: false } : {}),
         } as RunsChartsBarCardConfig;
 
         if (isSectionReordered) {
@@ -336,7 +566,9 @@ export abstract class RunsChartsCardConfig {
             prevChart.metricSectionId,
           ),
           metricKey: metricKey,
+          displayName: RunsChartsCardConfig.extractChartDisplayName(metricKey),
           deleted: prevChart.deleted,
+          ...(metricKey.startsWith(MLFLOW_SYSTEM_METRIC_PREFIX) ? { xAxisKey: 'time', useGlobalXaxisKey: false } : {}),
         } as RunsChartsLineCardConfig;
       }
     });
@@ -355,16 +587,15 @@ export abstract class RunsChartsCardConfig {
     });
 
     if (!isAccordionReordered) {
-      // If sections are in order (not been reordered), then sort alphabetically
+      // If sections are in order (not been reordered), then sort alphabetically.
+      // Append Model and System by name so we don't duplicate other sections when they're not the last two.
       const rest = resultSectionSet.filter(
         (section) => section.name !== MLFLOW_MODEL_METRIC_NAME && section.name !== MLFLOW_SYSTEM_METRIC_NAME,
       );
       rest.sort((a, b) => a.name.localeCompare(b.name));
-      resultSectionSet = [
-        ...rest,
-        compareRunSections[compareRunSections.length - 2],
-        compareRunSections[compareRunSections.length - 1],
-      ].filter((section) => !isNil(section));
+      const modelSection = compareRunSections.find((s) => s.name === MLFLOW_MODEL_METRIC_NAME);
+      const systemSection = compareRunSections.find((s) => s.name === MLFLOW_SYSTEM_METRIC_NAME);
+      resultSectionSet = [...rest, modelSection, systemSection].filter((section) => !isNil(section));
     }
 
     return { resultChartSet, resultSectionSet, isResultUpdated };
@@ -377,6 +608,27 @@ export class RunsChartsScatterCardConfig extends RunsChartsCardConfig {
   xaxis: RunsChartAxisDef = { key: '', type: 'METRIC' };
   yaxis: RunsChartAxisDef = { key: '', type: 'METRIC' };
   runsCountToCompare = 100;
+}
+
+export interface ChartRange {
+  xMin?: number;
+  xMax?: number;
+  yMin?: number;
+  yMax?: number;
+}
+
+export enum RunsChartsLineChartYAxisType {
+  METRIC = 'metric',
+  EXPRESSION = 'expression',
+}
+
+export interface RunsChartsLineChartExpression {
+  // The expression parsed in Reverse Polish Notation
+  rpn: (string | number)[];
+  // The parsed variables in the expression
+  variables: string[];
+  // The original input expression
+  expression: string;
 }
 
 // TODO: add configuration fields relevant to line chart
@@ -400,9 +652,24 @@ export class RunsChartsLineCardConfig extends RunsChartsCardConfig {
   lineSmoothness = 0;
 
   /**
+   * Scale type for X axis
+   */
+  xAxisScaleType: 'linear' | 'log' = 'linear';
+
+  /**
    * Y axis mode
    */
   scaleType: 'linear' | 'log' = 'linear';
+
+  /**
+   * Range of Y axis, X axis.
+   */
+  range?: ChartRange = {
+    xMin: undefined,
+    xMax: undefined,
+    yMin: undefined,
+    yMax: undefined,
+  };
 
   /**
    * Choose X axis mode - numeric step, relative time in seconds or absolute time value
@@ -413,6 +680,46 @@ export class RunsChartsLineCardConfig extends RunsChartsCardConfig {
    * Name of the metric to use for the X axis. Used when xAxisKey is set to 'metric'
    */
   selectedXAxisMetricKey = '';
+
+  /**
+   * Display points on the line chart. Undefined means "auto" mode, i.e. display points only when
+   * there are fewer than 60 datapoints on the chart.
+   */
+  displayPoints?: boolean = undefined;
+
+  /**
+   * Show metrics directly or custom expressions on metrics
+   */
+  yAxisKey?: RunsChartsLineChartYAxisType = RunsChartsLineChartYAxisType.METRIC;
+
+  /**
+   * Custom expressions for Y axis
+   */
+  yAxisExpressions?: RunsChartsLineChartExpression[] = [];
+
+  /**
+   * Whether or not to ignore outliers. If true, the data will be clipped
+   * to the 5th and 95th percentiles.
+   */
+  ignoreOutliers?: boolean = false;
+
+  /**
+   * Whether or not to use global X axis settings.
+   */
+  useGlobalXaxisKey?: boolean = true;
+
+  /**
+   * Whether or not to use global line smoothing setting.
+   */
+  useGlobalLineSmoothing?: boolean = true;
+
+  /**
+   * Configuration specific to node level system metrics
+   */
+  nodeLevelSystemMetricConfiguration?: {
+    metric: string;
+    type: 'node' | 'gpu';
+  };
 }
 
 // TODO: add configuration fields relevant to bar chart
@@ -423,6 +730,22 @@ export class RunsChartsBarCardConfig extends RunsChartsCardConfig {
    * A metric key used for chart's X axis
    */
   metricKey = '';
+
+  /**
+   * New key to support multiple metrics in grouped bar charts.
+   * NOTE: This key will not be present in older charts.
+   */
+  selectedMetricKeys?: string[];
+
+  /**
+   * If the chart is configured to use a particular dataset, this field will contain the dataset identifier.
+   */
+  datasetName?: string;
+
+  /**
+   * Present if the chart is configured to use a particular key to get data.
+   */
+  dataAccessKey?: string;
 }
 
 // TODO: add configuration fields relevant to contour chart
@@ -439,4 +762,52 @@ export class RunsChartsParallelCardConfig extends RunsChartsCardConfig {
   selectedParams: string[] = [];
   selectedMetrics: string[] = [];
   showAllRuns?: boolean = false;
+}
+
+export enum DifferenceCardConfigCompareGroup {
+  MODEL_METRICS = 'Model metrics',
+  SYSTEM_METRICS = 'System metrics',
+  PARAMETERS = 'Parameters',
+  ATTRIBUTES = 'Attributes',
+  TAGS = 'Tags',
+}
+
+export const DISABLED_GROUP_WHEN_GROUPBY = [
+  DifferenceCardConfigCompareGroup.PARAMETERS,
+  DifferenceCardConfigCompareGroup.TAGS,
+  DifferenceCardConfigCompareGroup.ATTRIBUTES,
+];
+
+export enum DifferenceCardAttributes {
+  USER = 'User',
+  SOURCE = 'Source',
+  VERSION = 'Version',
+  MODELS = 'Models',
+}
+
+// TODO: add configuration fields relevant to difference view chart
+export class RunsChartsDifferenceCardConfig extends RunsChartsCardConfig {
+  type: RunsChartType = RunsChartType.DIFFERENCE;
+  compareGroups: DifferenceCardConfigCompareGroup[] = [];
+  chartName = 'Runs difference view';
+  showChangeFromBaseline = true;
+  showDifferencesOnly = true;
+  baselineColumnUuid = '';
+}
+
+export class RunsChartsImageCardConfig extends RunsChartsCardConfig {
+  type: RunsChartType = RunsChartType.IMAGE;
+  // image keys to show
+  imageKeys: string[] = [];
+  step = 0;
+  showRunParams = true;
+}
+
+/**
+ * Defines a metric entry in the chart configuration, used to access dataset-specific metrics.
+ */
+export interface RunsChartsMetricByDatasetEntry {
+  dataAccessKey: string;
+  metricKey: string;
+  datasetName?: string;
 }

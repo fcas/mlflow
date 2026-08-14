@@ -14,6 +14,15 @@ export const useRunViewActiveTab = (): RunPageTabName => {
   if (tabParam === 'system-metrics') {
     return RunPageTabName.SYSTEM_METRIC_CHARTS;
   }
+  if (tabParam === 'evaluations') {
+    return RunPageTabName.EVALUATIONS;
+  }
+  if (tabParam === 'traces') {
+    return RunPageTabName.TRACES;
+  }
+  if (tabParam === 'issues') {
+    return RunPageTabName.ISSUES;
+  }
   if (tabParam?.match(/^(artifactPath|artifacts)/)) {
     return RunPageTabName.ARTIFACTS;
   }

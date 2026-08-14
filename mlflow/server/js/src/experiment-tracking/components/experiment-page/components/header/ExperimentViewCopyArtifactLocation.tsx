@@ -1,6 +1,6 @@
 import { CopyIcon, Typography } from '@databricks/design-system';
 import { useIntl } from 'react-intl';
-import { ExperimentEntity } from '../../../../types';
+import type { ExperimentEntity } from '../../../../types';
 
 /**
  * Experiment page header part responsible for copying
@@ -14,7 +14,7 @@ export const ExperimentViewCopyArtifactLocation = ({ experiment }: { experiment:
       size="md"
       dangerouslySetAntdProps={{
         copyable: {
-          text: experiment.artifact_location,
+          text: experiment.artifactLocation,
           icon: <CopyIcon />,
           tooltips: [
             intl.formatMessage({

@@ -5,7 +5,7 @@ import {
   GET_SAMPLED_METRIC_HISTORY_API_BULK,
   type GetSampledMetricHistoryBulkAction,
 } from '../sdk/SampledMetricHistoryService';
-import { SampledMetricsByRunUuidState } from '../types';
+import type { SampledMetricsByRunUuidState } from '../types';
 
 export const sampledMetricsByRunUuid = (
   state: SampledMetricsByRunUuidState = {},
@@ -17,12 +17,12 @@ export const sampledMetricsByRunUuid = (
   if (action.type === rejected(GET_SAMPLED_METRIC_HISTORY_API_BULK) && action.meta) {
     const { runUuids, key, rangeKey } = action.meta;
     const updatedState = { ...state };
-    const errorResult = {
-      error: action.payload,
-    };
     for (const runUuid of runUuids) {
       if (updatedState[runUuid]?.[key]?.[rangeKey]) {
+        const existingEntry = updatedState[runUuid][key][rangeKey];
         updatedState[runUuid][key][rangeKey] = {
+          // In case of failure, retain previous data entry and set error
+          ...existingEntry,
           error: action.payload,
           refreshing: false,
           loading: false,
@@ -60,12 +60,9 @@ export const sampledMetricsByRunUuid = (
           loading: true,
         };
       } else if (updatedState[runUuid][key][rangeKey] && isRefreshing) {
-        return {
-          ...state,
-          [runUuid]: {
-            ...state[runUuid],
-            [key]: { ...state[runUuid][key], [rangeKey]: { ...state[runUuid][key][rangeKey], refreshing: true } },
-          },
+        updatedState[runUuid][key][rangeKey] = {
+          ...updatedState[runUuid][key][rangeKey],
+          refreshing: true,
         };
       }
     }
@@ -82,9 +79,10 @@ export const sampledMetricsByRunUuid = (
       const resultList = resultsByRunUuid[runUuid];
       if (updatedState[runUuid]?.[key]?.[rangeKey]) {
         updatedState[runUuid][key][rangeKey] = {
-          metricsHistory: resultList,
+          metricsHistory: resultList || [],
           loading: false,
           refreshing: false,
+          lastUpdatedTime: Date.now(),
         };
       }
     }

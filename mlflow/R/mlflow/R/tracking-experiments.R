@@ -10,7 +10,7 @@
 #' @export
 mlflow_create_experiment <- function(name, artifact_location = NULL, client = NULL, tags = NULL) {
   client <- resolve_client(client)
-  name <- forge::cast_string(name)
+  name <- cast_string(name)
 
   tags <- if (!is.null(tags)) tags %>%
     purrr::imap(~ list(key = .y, value = .x)) %>%
@@ -82,7 +82,7 @@ mlflow_search_experiments <- function(filter = NULL,
 #' @param key Name of the tag. All storage backends are guaranteed to support
 #'   key values up to 250 bytes in size. This field is required.
 #' @param value String value of the tag being logged. All storage backends are
-#'   guaranteed to support key values up to 5000 bytes in size. This field is required.
+#'   guaranteed to support tag values up to 20000 bytes in size. This field is required.
 #' @param experiment_id ID of the experiment.
 #' @template roxlate-client
 #' @export

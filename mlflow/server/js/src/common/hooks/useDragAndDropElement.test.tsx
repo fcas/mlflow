@@ -1,7 +1,6 @@
-import { useDragAndDropElement } from './useDragAndDropElement';
-import { act, fireEvent, render, screen } from '../utils/TestUtils.react17';
-import { HTML5Backend } from 'react-dnd-html5-backend';
-import { DndProvider } from 'react-dnd';
+import { describe, jest, beforeEach, test, expect } from '@jest/globals';
+import { DragAndDropProvider, useDragAndDropElement } from './useDragAndDropElement';
+import { act, fireEvent, render, screen, waitFor } from '../utils/TestUtils.react18';
 
 describe('useDragAndDropElement', () => {
   const onDrop = jest.fn();
@@ -35,39 +34,49 @@ describe('useDragAndDropElement', () => {
     onDrop.mockClear();
   });
 
-  test('Test drag and drop within single group', async () => {
+  test('drag and drop within single group', async () => {
     render(
       <div>
-        <DndProvider backend={HTML5Backend}>
+        <DragAndDropProvider>
           <SingleComponent id="a" />
           <SingleComponent id="b" />
           <SingleComponent id="c" />
-        </DndProvider>
+        </DragAndDropProvider>
       </div>,
     );
 
+    // Split drag events into separate act() calls so each event is fully
+    // processed by react-dnd's state machine before the next one fires.
     await act(async () => {
       fireEvent.dragStart(screen.getByTestId('handle-a'));
+    });
+    await act(async () => {
       fireEvent.dragEnter(screen.getByTestId('element-b'));
     });
 
-    expect(screen.getByText('Drag is over element b')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText('Drag is over element b')).toBeInTheDocument();
+    });
 
     await act(async () => {
       fireEvent.dragEnter(screen.getByTestId('element-c'));
+    });
+    await act(async () => {
       fireEvent.drop(screen.getByTestId('element-c'));
     });
 
-    expect(onDrop).toHaveBeenLastCalledWith('test-key-a', 'test-key-c');
+    await waitFor(() => {
+      expect(onDrop).toHaveBeenLastCalledWith('test-key-a', 'test-key-c');
+    });
   });
 
   test('Prevent dropping on elements belonging to a different drag group', async () => {
     render(
       <div>
-        <DndProvider backend={HTML5Backend}>
+        <DragAndDropProvider>
           <SingleComponent id="a" groupKey="group_1" />
           <SingleComponent id="b" groupKey="group_2" />
-        </DndProvider>
+        </DragAndDropProvider>
       </div>,
     );
 
@@ -78,5 +87,22 @@ describe('useDragAndDropElement', () => {
     });
 
     expect(onDrop).not.toHaveBeenCalled();
+  });
+
+  test('Rendering two adjacent drag and drop providers works', async () => {
+    render(
+      <div>
+        <DragAndDropProvider>
+          <SingleComponent id="a" />
+        </DragAndDropProvider>
+        <DragAndDropProvider>
+          <SingleComponent id="b" />
+        </DragAndDropProvider>
+      </div>,
+    );
+
+    // We should have UI rendered without errors
+    expect(screen.getByText('Element a')).toBeInTheDocument();
+    expect(screen.getByText('Element b')).toBeInTheDocument();
   });
 });

@@ -1,39 +1,41 @@
-import { Button, Checkbox, FullscreenExitIcon, FullscreenIcon, SidebarIcon } from '@databricks/design-system';
-import { Theme } from '@emotion/react';
-import React, { useCallback, useState } from 'react';
+import { Button } from '@databricks/design-system';
+import type { Theme } from '@emotion/react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { FormattedMessage } from 'react-intl';
 import { useNavigate } from '../../../../../common/utils/RoutingUtils';
 import { Tooltip } from '@databricks/design-system';
-import { COLUMN_SORT_BY_ASC, LIFECYCLE_FILTER, SORT_DELIMITER_SYMBOL } from '../../../../constants';
+import { LIFECYCLE_FILTER } from '../../../../constants';
 import Routes from '../../../../routes';
-import { UpdateExperimentSearchFacetsFn, UpdateExperimentViewStateFn } from '../../../../types';
-import { SearchExperimentRunsFacetsState } from '../../models/SearchExperimentRunsFacetsState';
-import { SearchExperimentRunsViewState } from '../../models/SearchExperimentRunsViewState';
-import { ExperimentRunsSelectorResult } from '../../utils/experimentRuns.selector';
+import type { ExperimentPageViewState } from '../../models/ExperimentPageViewState';
+import type { ExperimentRunsSelectorResult } from '../../utils/experimentRuns.selector';
 import { ExperimentViewRunModals } from './ExperimentViewRunModals';
-import { ExperimentViewRunsSortSelector } from './ExperimentViewRunsSortSelector';
-import { ExperimentViewRunsColumnSelector } from './ExperimentViewRunsColumnSelector';
-import { TAGS_TO_COLUMNS_MAP } from '../../utils/experimentPage.column-utils';
-import type { ExperimentRunSortOption } from '../../hooks/useRunSortOptions';
-import { ToggleIconButton } from '../../../../../common/components/ToggleIconButton';
-import { useExperimentIds } from '../../hooks/useExperimentIds';
+import type { ExperimentPageSearchFacetsState } from '../../models/ExperimentPageSearchFacetsState';
+import type { RunInfoEntity } from '../../../../types';
+import { useDesignSystemTheme } from '@databricks/design-system';
+import { ExperimentViewRunsControlsActionsSelectTags } from './ExperimentViewRunsControlsActionsSelectTags';
+import { useRegisterSelectedIds } from '@mlflow/mlflow/src/assistant';
 
 export type ExperimentViewRunsControlsActionsProps = {
-  viewState: SearchExperimentRunsViewState;
-  searchFacetsState: SearchExperimentRunsFacetsState;
+  viewState: ExperimentPageViewState;
+  searchFacetsState: ExperimentPageSearchFacetsState;
   runsData: ExperimentRunsSelectorResult;
   refreshRuns: () => void;
 };
 
-const CompareRunsButtonWrapper: React.FC = ({ children }) => <>{children}</>;
+const CompareRunsButtonWrapper: React.FC<React.PropsWithChildren<unknown>> = ({ children }) => <>{children}</>;
 
 export const ExperimentViewRunsControlsActions = React.memo(
+  // eslint-disable-next-line react-component-name/react-component-name -- TODO(FEINF-4716)
   ({ viewState, runsData, searchFacetsState, refreshRuns }: ExperimentViewRunsControlsActionsProps) => {
     const { runsSelected } = viewState;
-    const { runInfos } = runsData;
+    const { runInfos, tagsList } = runsData;
     const { lifecycleFilter } = searchFacetsState;
 
     const navigate = useNavigate();
+    const { theme } = useDesignSystemTheme();
+
+    // Register selected runs with the Assistant context
+    useRegisterSelectedIds('selectedRunIds', runsSelected);
 
     const [showDeleteRunModal, setShowDeleteRunModal] = useState(false);
     const [showRestoreRunModal, setShowRestoreRunModal] = useState(false);
@@ -42,9 +44,9 @@ export const ExperimentViewRunsControlsActions = React.memo(
 
     const renameButtonClicked = useCallback(() => {
       const runsSelectedList = Object.keys(runsSelected);
-      const selectedRun = runInfos.find((info) => info.run_uuid === runsSelectedList[0]);
+      const selectedRun = runInfos.find((info) => info.runUuid === runsSelectedList[0]);
       if (selectedRun) {
-        setRenamedRunName(selectedRun.run_name);
+        setRenamedRunName(selectedRun.runName);
         setShowRenameRunModal(true);
       }
     }, [runInfos, runsSelected]);
@@ -52,8 +54,8 @@ export const ExperimentViewRunsControlsActions = React.memo(
     const compareButtonClicked = useCallback(() => {
       const runsSelectedList = Object.keys(runsSelected);
       const experimentIds = runInfos
-        .filter(({ run_uuid }: any) => runsSelectedList.includes(run_uuid))
-        .map(({ experiment_id }: any) => experiment_id);
+        .filter(({ runUuid }: RunInfoEntity) => runsSelectedList.includes(runUuid))
+        .map(({ experimentId }: any) => experimentId);
 
       navigate(Routes.getCompareRunPageRoute(runsSelectedList, [...new Set(experimentIds)].sort()));
     }, [navigate, runInfos, runsSelected]);
@@ -94,7 +96,6 @@ export const ExperimentViewRunsControlsActions = React.memo(
             >
               <FormattedMessage
                 defaultMessage="Delete"
-                // eslint-disable-next-line max-len
                 description="String for the delete button to delete a particular experiment run"
               />
             </Button>
@@ -108,7 +109,6 @@ export const ExperimentViewRunsControlsActions = React.memo(
             >
               <FormattedMessage
                 defaultMessage="Restore"
-                // eslint-disable-next-line max-len
                 description="String for the restore button to undo the experiments that were deleted"
               />
             </Button>
@@ -123,11 +123,18 @@ export const ExperimentViewRunsControlsActions = React.memo(
             >
               <FormattedMessage
                 defaultMessage="Compare"
-                // eslint-disable-next-line max-len
                 description="String for the compare button to compare experiment runs to find an ideal model"
               />
             </Button>
           </CompareRunsButtonWrapper>
+
+          <div css={styles.buttonSeparator} />
+          <ExperimentViewRunsControlsActionsSelectTags
+            runsSelected={runsSelected}
+            runInfos={runInfos}
+            tagsList={tagsList}
+            refreshRuns={refreshRuns}
+          />
         </div>
         <ExperimentViewRunModals
           runsSelected={runsSelected}

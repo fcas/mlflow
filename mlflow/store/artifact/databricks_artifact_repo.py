@@ -3,8 +3,10 @@ import json
 import logging
 import os
 import posixpath
+import tempfile
 import uuid
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -16,35 +18,51 @@ from mlflow.azure.client import (
     put_block,
     put_block_list,
 )
-from mlflow.entities import FileInfo
+from mlflow.entities import FileInfo, TraceData
 from mlflow.environment_variables import (
+    MLFLOW_ASYNC_TRACE_LOGGING_RETRY_TIMEOUT,
     MLFLOW_MULTIPART_DOWNLOAD_CHUNK_SIZE,
     MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE,
+    MLFLOW_MULTIPART_UPLOAD_MINIMUM_FILE_SIZE,
 )
-from mlflow.exceptions import MlflowException, MlflowTraceDataCorrupted, MlflowTraceDataNotFound
+from mlflow.exceptions import (
+    MlflowException,
+    MlflowNotImplementedException,
+    MlflowTraceDataCorrupted,
+    MlflowTraceDataNotFound,
+)
 from mlflow.protos.databricks_artifacts_pb2 import (
     ArtifactCredentialType,
     CompleteMultipartUpload,
     CreateMultipartUpload,
     DatabricksMlflowArtifactsService,
-    GetCredentialsForRead,
-    GetCredentialsForTraceDataDownload,
-    GetCredentialsForTraceDataUpload,
-    GetCredentialsForWrite,
     GetPresignedUploadPartUrl,
     PartEtag,
 )
 from mlflow.protos.databricks_pb2 import (
     INTERNAL_ERROR,
     INVALID_PARAMETER_VALUE,
+    RESOURCE_DOES_NOT_EXIST,
 )
-from mlflow.protos.service_pb2 import GetRun, ListArtifacts, MlflowService
-from mlflow.store.artifact.artifact_repo import write_local_temp_trace_data_file
+from mlflow.protos.service_pb2 import MlflowService
+from mlflow.store.artifact.artifact_repo import (
+    _validate_attachment_path,
+    write_local_temp_trace_data_file,
+)
 from mlflow.store.artifact.cloud_artifact_repo import (
     CloudArtifactRepository,
     _complete_futures,
     _compute_num_chunks,
+    _validate_chunk_size_aws,
 )
+from mlflow.store.artifact.databricks_artifact_repo_resources import (
+    _CredentialType,
+    _LoggedModel,
+    _Resource,
+    _Run,
+    _Trace,
+)
+from mlflow.tracing.constant import TRACE_REQUEST_ID_PREFIX
 from mlflow.utils import chunk_list
 from mlflow.utils.databricks_utils import get_databricks_host_creds
 from mlflow.utils.file_utils import (
@@ -69,6 +87,8 @@ from mlflow.utils.uri import (
 
 _logger = logging.getLogger(__name__)
 _MAX_CREDENTIALS_REQUEST_SIZE = 2000  # Max number of artifact paths in a single credentials request
+_TRACE_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+_TRACE_DOWNLOAD_MAX_STREAM_ATTEMPTS = 2
 _SERVICE_AND_METHOD_TO_INFO = {
     service: extract_api_info_for_service(service, _REST_API_PATH_PREFIX)
     for service in [MlflowService, DatabricksMlflowArtifactsService]
@@ -83,11 +103,14 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
     Signed access URIs for S3 / Azure Blob Storage are fetched from the MLflow service and used to
     read and write files from/to this location.
 
-    The artifact_uri is expected to be of the form
-    dbfs:/databricks/mlflow-tracking/<EXP_ID>/<RUN_ID>/
+    The artifact_uri is expected to be in one of the following forms:
+    - dbfs:/databricks/mlflow-tracking/<EXP_ID>/<RUN_ID>/
+    - databricks/mlflow-tracking/<EXP_ID>/logged_models/<MODEL_ID>/artifacts/<path>
     """
 
-    def __init__(self, artifact_uri):
+    def __init__(
+        self, artifact_uri: str, tracking_uri: str | None = None, registry_uri: str | None = None
+    ) -> None:
         if not is_valid_dbfs_uri(artifact_uri):
             raise MlflowException(
                 message="DBFS URI must be of the form dbfs:/<path> or "
@@ -104,57 +127,63 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             )
         # The dbfs:/ path ultimately used for artifact operations should not contain the
         # Databricks profile info, so strip it before setting ``artifact_uri``.
-        super().__init__(remove_databricks_profile_info_from_artifact_uri(artifact_uri))
+        super().__init__(
+            remove_databricks_profile_info_from_artifact_uri(artifact_uri),
+            tracking_uri,
+            registry_uri,
+        )
 
         self.databricks_profile_uri = (
             get_databricks_profile_uri_from_artifact_uri(artifact_uri)
             or mlflow.tracking.get_tracking_uri()
         )
-        self.run_id = self._extract_run_id(self.artifact_uri)
-        self._run_relative_artifact_repo_root_path = None
+        self.resource = self._extract_resource(self.artifact_uri)
 
-    @property
-    def run_relative_artifact_repo_root_path(self):
+    def _extract_resource(self, artifact_uri) -> _Resource:
         """
-        Lazily computes the run-relative artifact repository root path to skip the run existence
-        check when downloading/uploading trace data.
-        """
-        if self._run_relative_artifact_repo_root_path is None:
-            # Fetch the artifact root for the MLflow Run associated with `artifact_uri` and compute
-            # the path of `artifact_uri` relative to the MLflow Run's artifact root
-            # (the `run_relative_artifact_repo_root_path`). All operations performed on this
-            # artifact repository will be performed relative to this computed location
-            artifact_repo_root_path = extract_and_normalize_path(self.artifact_uri)
-            run_artifact_root_uri = self._get_run_artifact_root(self.run_id)
-            run_artifact_root_path = extract_and_normalize_path(run_artifact_root_uri)
-            run_relative_root_path = posixpath.relpath(
-                path=artifact_repo_root_path, start=run_artifact_root_path
-            )
-            # If the paths are equal, then use empty string over "./" for ListArtifact compatibility
-            self._run_relative_artifact_repo_root_path = (
-                "" if run_artifact_root_path == artifact_repo_root_path else run_relative_root_path
-            )
-
-        return self._run_relative_artifact_repo_root_path
-
-    @staticmethod
-    def _extract_run_id(artifact_uri):
-        """
-        The artifact_uri is expected to be
-        dbfs:/databricks/mlflow-tracking/<EXP_ID>/<RUN_ID>/artifacts/<path>
-        Once the path from the input uri is extracted and normalized, it is
-        expected to be of the form
-        databricks/mlflow-tracking/<EXP_ID>/<RUN_ID>/artifacts/<path>
-
-        Hence the run_id is the 4th element of the normalized path.
+        The artifact_uri is expected to be in one of the following formats:
+        - dbfs:/databricks/mlflow-tracking/<EXP_ID>/<RUN_ID>/artifacts/<path>
+        - dbfs:/databricks/mlflow-tracking/<EXP_ID>/logged_models/<MODEL_ID>/artifacts/<path>
+        - databricks/mlflow-tracking/<EXP_ID>/<RUN_ID>/artifacts/<path>
+        - databricks/mlflow-tracking/<EXP_ID>/logged_models/<MODEL_ID>/artifacts/<path>
 
         Returns:
-            run_id extracted from the artifact_uri.
+            A `_Resource` object representing the MLflow resource associated with the specified
+            artifact URI.
         """
         artifact_path = extract_and_normalize_path(artifact_uri)
-        return artifact_path.split("/")[3]
+        parts = artifact_path.split("/")
 
-    def _call_endpoint(self, service, api, json_body=None, path_params=None):
+        if parts[3] == "logged_models":
+            return _LoggedModel(
+                id_=parts[4], artifact_uri=artifact_uri, call_endpoint=self._call_endpoint
+            )
+
+        if parts[3].startswith(TRACE_REQUEST_ID_PREFIX):
+            return _Trace(
+                id_=parts[3], artifact_uri=artifact_uri, call_endpoint=self._call_endpoint
+            )
+
+        return _Run(id_=parts[3], artifact_uri=artifact_uri, call_endpoint=self._call_endpoint)
+
+    @staticmethod
+    def _extract_run_id(artifact_uri: str) -> str | None:
+        """
+        Extracts the run ID from the run artifact URI.
+        """
+        artifact_path = extract_and_normalize_path(artifact_uri)
+        parts = artifact_path.split("/")
+        if len(parts) < 4:
+            return None
+
+        if parts[3] == "logged_models" or parts[3].startswith(TRACE_REQUEST_ID_PREFIX):
+            return None
+
+        return parts[3]
+
+    def _call_endpoint(
+        self, service, api, json_body=None, path_params=None, retry_timeout_seconds=None
+    ):
         """
         Calls the specified REST endpoint with the specified JSON body and path parameters.
 
@@ -163,6 +192,7 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             api: The API to call.
             json_body: The JSON body of the request.
             path_params: The path parameters to substitute into the endpoint URI.
+            retry_timeout_seconds: The timeout in seconds for retrying failed requests.
 
         Returns:
             The response from the REST endpoint.
@@ -172,43 +202,44 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
         if path_params:
             endpoint = endpoint.format(**path_params)
         response_proto = api.Response()
-        return call_endpoint(db_creds, endpoint, method, json_body, response_proto)
 
-    def _get_run_artifact_root(self, run_id):
-        json_body = message_to_json(GetRun(run_id=run_id))
-        run_response = self._call_endpoint(MlflowService, GetRun, json_body)
-        return run_response.run.info.artifact_uri
+        return call_endpoint(
+            host_creds=db_creds,
+            endpoint=endpoint,
+            method=method,
+            json_body=json_body,
+            response_proto=response_proto,
+            retry_timeout_seconds=retry_timeout_seconds,
+        )
 
-    def _get_credential_infos(self, request_message_class, run_id, paths):
+    def _get_credential_infos(self, cred_type: _CredentialType, paths: list[str]):
         """
         Issue one or more requests for artifact credentials, providing read or write
-        access to the specified run-relative artifact `paths` within the MLflow Run specified
-        by `run_id`. The type of access credentials, read or write, is specified by
-        `request_message_class`.
+        access to the specified resource relative artifact `paths` within the MLflow
+        resource specified by `self.resource.id`. The type of access credentials, read or write,
+        is specified by `request_message_class`.
 
         Args:
-            paths: The specified run-relative artifact paths within the MLflow Run.
-            run_id: The specified MLflow Run.
-            request_message_class: Specifies the type of access credentials, read or write.
+            cred_type: Specifies the type of access credentials, read or write.
+            paths: The specified relative artifact paths within the MLflow resource.
 
         Returns:
             A list of `ArtifactCredentialInfo` objects providing read access to the specified
-            run-relative artifact `paths` within the MLflow Run specified by `run_id`.
+            relative artifact `paths` within the MLflow resource specified by `resource`.
         """
         credential_infos = []
 
         for paths_chunk in chunk_list(paths, _MAX_CREDENTIALS_REQUEST_SIZE):
             page_token = None
             while True:
-                json_body = message_to_json(
-                    request_message_class(run_id=run_id, path=paths_chunk, page_token=page_token)
+                cred_infos, next_page_token = self.resource.get_credentials(
+                    cred_type=cred_type,
+                    paths=paths_chunk,
+                    page_token=page_token,
                 )
-                response = self._call_endpoint(
-                    DatabricksMlflowArtifactsService, request_message_class, json_body
-                )
-                credential_infos += response.credential_infos
-                page_token = response.next_page_token
-                if not page_token or len(response.credential_infos) == 0:
+                credential_infos += cred_infos
+                page_token = next_page_token
+                if not page_token or len(cred_infos) == 0:
                     break
 
         return credential_infos
@@ -216,48 +247,114 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
     def _get_write_credential_infos(self, remote_file_paths):
         """
         A list of `ArtifactCredentialInfo` objects providing write access to the specified
-        run-relative artifact `paths` within the MLflow Run specified by `run_id`.
+        relative artifact `paths` within the MLflow resource specified by `self.resource.id`.
         """
-        run_relative_remote_paths = [
-            posixpath.join(self.run_relative_artifact_repo_root_path, p or "")
-            for p in remote_file_paths
+        relative_remote_paths = [
+            posixpath.join(self.resource.relative_path, p or "") for p in remote_file_paths
         ]
-        return self._get_credential_infos(
-            GetCredentialsForWrite, self.run_id, run_relative_remote_paths
-        )
+        return self._get_credential_infos(_CredentialType.WRITE, relative_remote_paths)
 
-    def download_trace_data(self) -> Dict[str, Any]:
-        cred = self._call_endpoint(
-            DatabricksMlflowArtifactsService,
-            GetCredentialsForTraceDataDownload,
-            path_params={"request_id": self.run_id},
-        )
-        signed_uri = cred.credential_info.signed_uri
-        headers = self._extract_headers_from_credentials(cred.credential_info.headers)
-        with cloud_storage_http_request("get", signed_uri, headers=headers) as resp:
-            try:
-                augmented_raise_for_status(resp)
-            except requests.HTTPError as e:
-                if e.response.status_code == 404:
-                    raise MlflowTraceDataNotFound(request_id=self.run_id) from e
-                raise
+    def _validate_streamed_trace_download(
+        self, response: requests.Response, expected_length: str | None, bytes_written: int
+    ) -> None:
+        if expected_length is None:
+            return
 
+        try:
+            expected_length_int = int(expected_length)
+        except ValueError:
+            return
+
+        actual_length = None
+        raw_tell = getattr(getattr(response, "raw", None), "tell", None)
+        if callable(raw_tell):
             try:
-                return json.loads(resp.content)
+                actual_length = raw_tell()
+            except Exception:
+                actual_length = None
+
+        if actual_length is None and not response.headers.get("Content-Encoding"):
+            actual_length = bytes_written
+
+        if actual_length is not None and actual_length < expected_length_int:
+            raise requests.ConnectionError(
+                f"Incomplete download: read {actual_length} of {expected_length_int} bytes"
+            )
+
+    def _stream_trace_response_to_path(self, response: requests.Response, dst_path: Path) -> Path:
+        partial_path = Path(f"{dst_path}.part")
+        bytes_written = 0
+        try:
+            with partial_path.open("wb") as output_file:
+                for chunk in response.iter_content(chunk_size=_TRACE_DOWNLOAD_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    output_file.write(chunk)
+                    bytes_written += len(chunk)
+
+            self._validate_streamed_trace_download(
+                response, response.headers.get("Content-Length"), bytes_written
+            )
+            os.replace(partial_path, dst_path)
+            return dst_path
+        except Exception:
+            partial_path.unlink(missing_ok=True)
+            raise
+
+    def _download_trace_file_to_path(
+        self, signed_uri: str, dst_path: Path, headers: dict[str, str]
+    ) -> Path:
+        try:
+            for attempt in range(1, _TRACE_DOWNLOAD_MAX_STREAM_ATTEMPTS + 1):
+                with cloud_storage_http_request(
+                    "get", signed_uri, stream=True, headers=headers
+                ) as response:
+                    augmented_raise_for_status(response)
+                    try:
+                        return self._stream_trace_response_to_path(response, dst_path)
+                    except requests.RequestException as e:
+                        if attempt == _TRACE_DOWNLOAD_MAX_STREAM_ATTEMPTS:
+                            raise
+                        _logger.warning(
+                            "Retrying streamed trace artifact download after attempt %s/%s: %s",
+                            attempt,
+                            _TRACE_DOWNLOAD_MAX_STREAM_ATTEMPTS,
+                            e,
+                        )
+        except requests.RequestException:
+            dst_path.unlink(missing_ok=True)
+            raise
+
+    def download_trace_data_to_file(self, dst_path: Path) -> Path:
+        [cred], _ = self.resource.get_credentials(cred_type=_CredentialType.READ)
+        signed_uri = cred.signed_uri
+        headers = self._extract_headers_from_credentials(cred.headers)
+        try:
+            return self._download_trace_file_to_path(signed_uri, dst_path, headers)
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                raise MlflowTraceDataNotFound(request_id=self.resource.id) from e
+            raise
+
+    def download_trace_data(self) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dst = Path(temp_dir, "traces.json")
+            self.download_trace_data_to_file(dst)
+            try:
+                return json.loads(dst.read_text(encoding="utf-8"))
             except json.JSONDecodeError as e:
-                raise MlflowTraceDataCorrupted(request_id=self.run_id) from e
+                raise MlflowTraceDataCorrupted(request_id=self.resource.id) from e
 
-    def _get_upload_trace_data_cred_info(self):
-        res = self._call_endpoint(
-            DatabricksMlflowArtifactsService,
-            GetCredentialsForTraceDataUpload,
-            path_params={"request_id": self.run_id},
+    def download_archived_trace_data(self) -> TraceData:
+        raise MlflowNotImplementedException(
+            "Databricks trace artifact repositories do not yet support ARCHIVE_REPO trace payloads."
         )
-        return res.credential_info
 
     def upload_trace_data(self, trace_data: str) -> None:
         cred = self._get_upload_trace_data_cred_info()
         with write_local_temp_trace_data_file(trace_data) as temp_file:
+            # Upload trace data synchronously to avoid ThreadPoolExecutor deadlock during Python
+            # interpreter shutdown, which causes "cannot schedule new futures after shutdown" error.
             if cred.type == ArtifactCredentialType.AZURE_ADLS_GEN2_SAS_URI:
                 self._azure_adls_gen2_upload_file(
                     credentials=cred,
@@ -266,6 +363,7 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                     get_credentials=lambda artifact_paths: [
                         self._get_upload_trace_data_cred_info()
                     ],
+                    is_sync=True,
                 )
             elif cred.type == ArtifactCredentialType.AZURE_SAS_URI:
                 self._azure_upload_file(
@@ -275,18 +373,100 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                     get_credentials=lambda artifact_paths: [
                         self._get_upload_trace_data_cred_info()
                     ],
+                    is_sync=True,
                 )
-            elif (
-                cred.type == ArtifactCredentialType.AWS_PRESIGNED_URL
-                or cred.type == ArtifactCredentialType.GCP_SIGNED_URL
+            elif cred.type in (
+                ArtifactCredentialType.AWS_PRESIGNED_URL,
+                ArtifactCredentialType.GCP_SIGNED_URL,
             ):
                 self._signed_url_upload_file(cred, temp_file)
+
+    def upload_archived_trace_data(self, trace_data: TraceData) -> None:
+        raise MlflowNotImplementedException(
+            "Databricks trace artifact repositories do not yet support ARCHIVE_REPO trace payloads."
+        )
+
+    def upload_archived_trace_data_bytes(self, data: bytes) -> None:
+        raise MlflowNotImplementedException(
+            "Databricks trace artifact repositories do not yet support ARCHIVE_REPO trace payloads."
+        )
+
+    def _get_upload_trace_data_cred_info(self):
+        """Returns the credential info for trace data upload."""
+        [cred], _ = self.resource.get_credentials(
+            cred_type=_CredentialType.WRITE,
+            timeout=MLFLOW_ASYNC_TRACE_LOGGING_RETRY_TIMEOUT.get(),
+        )
+        return cred
+
+    def download_trace_attachment_to_file(self, path: str, dst_path: Path) -> Path:
+        _validate_attachment_path(path)
+        artifact_path = posixpath.join("attachments", path)
+        [cred], _ = self.resource.get_credentials(
+            cred_type=_CredentialType.READ,
+            artifact_path=artifact_path,
+        )
+        headers = self._extract_headers_from_credentials(cred.headers)
+        try:
+            return self._download_trace_file_to_path(cred.signed_uri, dst_path, headers)
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                raise MlflowException(
+                    f"Attachment '{path}' not found.",
+                    error_code=RESOURCE_DOES_NOT_EXIST,
+                ) from e
+            raise
+
+    def download_trace_attachment(self, path: str) -> bytes:
+        _validate_attachment_path(path)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dst = Path(temp_dir, path)
+            self.download_trace_attachment_to_file(path, dst)
+            return dst.read_bytes()
+
+    def upload_attachment(self, attachment_id: str, content_bytes: bytes) -> None:
+        _validate_attachment_path(attachment_id)
+        artifact_path = posixpath.join("attachments", attachment_id)
+        [cred], _ = self.resource.get_credentials(
+            cred_type=_CredentialType.WRITE,
+            artifact_path=artifact_path,
+            timeout=MLFLOW_ASYNC_TRACE_LOGGING_RETRY_TIMEOUT.get(),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_file = str(Path(temp_dir, attachment_id))
+            Path(temp_file).write_bytes(content_bytes)
+            if cred.type == ArtifactCredentialType.AZURE_ADLS_GEN2_SAS_URI:
+                self._azure_adls_gen2_upload_file(
+                    credentials=cred,
+                    local_file=temp_file,
+                    artifact_file_path=None,
+                    get_credentials=lambda _: [cred],
+                    is_sync=True,
+                )
+            elif cred.type == ArtifactCredentialType.AZURE_SAS_URI:
+                self._azure_upload_file(
+                    credentials=cred,
+                    local_file=temp_file,
+                    artifact_file_path=None,
+                    get_credentials=lambda _: [cred],
+                    is_sync=True,
+                )
+            elif cred.type in (
+                ArtifactCredentialType.AWS_PRESIGNED_URL,
+                ArtifactCredentialType.GCP_SIGNED_URL,
+            ):
+                self._signed_url_upload_file(cred, temp_file)
+            else:
+                raise MlflowException(
+                    f"Unsupported credential type for attachment upload: {cred.type}",
+                    error_code=INTERNAL_ERROR,
+                )
 
     def _get_read_credential_infos(self, remote_file_paths):
         """
         Returns:
             A list of `ArtifactCredentialInfo` objects providing read access to the specified
-            run-relative artifact `paths` within the MLflow Run specified by `run_id`.
+            relative artifact `paths` within the MLflow resource specified.
         """
         if type(remote_file_paths) == str:
             remote_file_paths = [remote_file_paths]
@@ -294,12 +474,10 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             raise MlflowException(
                 f"Expected `paths` to be a list of strings. Got {type(remote_file_paths)}"
             )
-        run_relative_remote_paths = [
-            posixpath.join(self.run_relative_artifact_repo_root_path, p) for p in remote_file_paths
+        relative_remote_paths = [
+            posixpath.join(self.resource.relative_path, p) for p in remote_file_paths
         ]
-        return self._get_credential_infos(
-            GetCredentialsForRead, self.run_id, run_relative_remote_paths
-        )
+        return self._get_credential_infos(_CredentialType.READ, relative_remote_paths)
 
     def _extract_headers_from_credentials(self, headers):
         """
@@ -348,7 +526,9 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                 raise e
         return block_id
 
-    def _azure_upload_file(self, credentials, local_file, artifact_file_path, get_credentials):
+    def _azure_upload_file(
+        self, credentials, local_file, artifact_file_path, get_credentials, is_sync=False
+    ):
         """
         Uploads a file to a given Azure storage location.
         The function uses a file chunking generator with 100 MB being the size limit for each chunk.
@@ -364,15 +544,14 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             local_file: The local file to upload.
             artifact_file_path: The path to the artifact file.
             get_credentials: The function to call to get new credentials.
+            is_sync: If True, upload synchronously without threading.
         """
         try:
             headers = self._extract_headers_from_credentials(credentials.headers)
-            futures = {}
             num_chunks = _compute_num_chunks(local_file, MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get())
-            for index in range(num_chunks):
-                start_byte = index * MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get()
-                future = self.chunk_thread_pool.submit(
-                    self._azure_upload_chunk,
+
+            def upload_chunks_func(start_byte):
+                return self._azure_upload_chunk(
                     credentials=credentials,
                     headers=headers,
                     local_file=local_file,
@@ -381,15 +560,33 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                     size=MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get(),
                     get_credentials=get_credentials,
                 )
-                futures[future] = index
 
-            results, errors = _complete_futures(futures, local_file)
-            if errors:
-                raise MlflowException(
-                    f"Failed to upload at least one part of {local_file}. Errors: {errors}"
-                )
-            # Sort results by the chunk index
-            uploading_block_list = [results[index] for index in sorted(results)]
+            if is_sync:
+                # Upload chunks synchronously without threading
+                results = {}
+                for index in range(num_chunks):
+                    start_byte = index * MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get()
+                    block_id = upload_chunks_func(start_byte)
+                    results[index] = block_id
+                uploading_block_list = [results[index] for index in sorted(results)]
+            else:
+                # Upload chunks asynchronously with threading
+                futures = {}
+                for index in range(num_chunks):
+                    start_byte = index * MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get()
+                    future = self.chunk_thread_pool.submit(
+                        upload_chunks_func,
+                        start_byte,
+                    )
+                    futures[future] = index
+
+                results, errors = _complete_futures(futures, local_file)
+                if errors:
+                    raise MlflowException(
+                        f"Failed to upload at least one part of {local_file}. Errors: {errors}"
+                    )
+                # Sort results by the chunk index
+                uploading_block_list = [results[index] for index in sorted(results)]
 
             try:
                 put_block_list(credentials.signed_uri, uploading_block_list, headers=headers)
@@ -434,7 +631,7 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                 raise e
 
     def _azure_adls_gen2_upload_file(
-        self, credentials, local_file, artifact_file_path, get_credentials
+        self, credentials, local_file, artifact_file_path, get_credentials, is_sync=False
     ):
         """
         Uploads a file to a given Azure storage location using the ADLS gen2 API.
@@ -444,6 +641,7 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             local_file: The local file to upload.
             artifact_file_path: The path to the artifact file.
             get_credentials: The function to call to get new credentials.
+            is_sync: If True, upload synchronously without threading.
         """
         try:
             headers = self._extract_headers_from_credentials(credentials.headers)
@@ -458,14 +656,12 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             )
 
             # next try to append the file
-            futures = {}
             file_size = os.path.getsize(local_file)
             num_chunks = _compute_num_chunks(local_file, MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get())
             use_single_part_upload = num_chunks == 1
-            for index in range(num_chunks):
-                start_byte = index * MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get()
-                future = self.chunk_thread_pool.submit(
-                    self._retryable_adls_function,
+
+            def upload_chunks_func(start_byte):
+                return self._retryable_adls_function(
                     func=patch_adls_file_upload,
                     artifact_file_path=artifact_file_path,
                     get_credentials=get_credentials,
@@ -477,13 +673,29 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                     headers=headers,
                     is_single=use_single_part_upload,
                 )
-                futures[future] = index
 
-            _, errors = _complete_futures(futures, local_file)
-            if errors:
-                raise MlflowException(
-                    f"Failed to upload at least one part of {artifact_file_path}. Errors: {errors}"
-                )
+            if is_sync:
+                # Upload chunks synchronously without threading
+                for index in range(num_chunks):
+                    start_byte = index * MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get()
+                    upload_chunks_func(start_byte)
+            else:
+                # Upload chunks asynchronously with threading
+                futures = {}
+                for index in range(num_chunks):
+                    start_byte = index * MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get()
+                    future = self.chunk_thread_pool.submit(
+                        upload_chunks_func,
+                        start_byte,
+                    )
+                    futures[future] = index
+
+                _, errors = _complete_futures(futures, local_file)
+                if errors:
+                    raise MlflowException(
+                        f"Failed to upload at least one part of {artifact_file_path}. "
+                        f"Errors: {errors}"
+                    )
 
             # finally try to flush the file
             if not use_single_part_upload:
@@ -520,12 +732,12 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
     def _upload_to_cloud(self, cloud_credential_info, src_file_path, artifact_file_path):
         """
         Upload a local file to the cloud. Note that in this artifact repository, files are uploaded
-        to run-relative artifact file paths in the artifact repository.
+        to resource relative artifact file paths in the artifact repository.
 
         Args:
             cloud_credential_info: ArtifactCredentialInfo object with presigned URL for the file.
             src_file_path: Local source file path for the upload.
-            artifact_file_path: Path in the artifact repository, relative to the run root path,
+            artifact_file_path: Path in the artifact repository, relative to the resource root path,
                 where the artifact will be logged.
 
         """
@@ -544,7 +756,8 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
                 self._get_write_credential_infos,
             )
         elif cloud_credential_info.type == ArtifactCredentialType.AWS_PRESIGNED_URL:
-            if os.path.getsize(src_file_path) > MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get():
+            if os.path.getsize(src_file_path) > MLFLOW_MULTIPART_UPLOAD_MINIMUM_FILE_SIZE.get():
+                _validate_chunk_size_aws(MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get())
                 self._multipart_upload(src_file_path, artifact_file_path)
             else:
                 self._signed_url_upload_file(cloud_credential_info, src_file_path)
@@ -560,7 +773,7 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
         Download a file from the input `remote_file_path` and save it to `local_path`.
 
         Args:
-            remote_file_path: Path relative to the run root path to file in remote artifact
+            remote_file_path: Path relative to the resource root path to file in remote artifact
                 repository.
             local_path: Local path to download file to.
 
@@ -686,16 +899,16 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
 
     def _multipart_upload(self, local_file, artifact_file_path):
         run_relative_artifact_path = posixpath.join(
-            self.run_relative_artifact_repo_root_path, artifact_file_path or ""
+            self.resource.relative_path, artifact_file_path or ""
         )
         num_parts = _compute_num_chunks(local_file, MLFLOW_MULTIPART_UPLOAD_CHUNK_SIZE.get())
         create_mpu_resp = self._create_multipart_upload(
-            self.run_id, run_relative_artifact_path, num_parts
+            self.resource.id, run_relative_artifact_path, num_parts
         )
         try:
             part_etags = self._upload_parts(local_file, create_mpu_resp)
             self._complete_multipart_upload(
-                self.run_id,
+                self.resource.id,
                 run_relative_artifact_path,
                 create_mpu_resp.upload_id,
                 part_etags,
@@ -717,38 +930,8 @@ class DatabricksArtifactRepository(CloudArtifactRepository):
             artifact_file_path=artifact_file_path,
         )
 
-    def list_artifacts(self, path=None):
-        if path:
-            run_relative_path = posixpath.join(self.run_relative_artifact_repo_root_path, path)
-        else:
-            run_relative_path = self.run_relative_artifact_repo_root_path
-        infos = []
-        page_token = None
-        while True:
-            json_body = message_to_json(
-                ListArtifacts(run_id=self.run_id, path=run_relative_path, page_token=page_token)
-            )
-            response = self._call_endpoint(MlflowService, ListArtifacts, json_body)
-            artifact_list = response.files
-            # If `path` is a file, ListArtifacts returns a single list element with the
-            # same name as `path`. The list_artifacts API expects us to return an empty list in this
-            # case, so we do so here.
-            if (
-                len(artifact_list) == 1
-                and artifact_list[0].path == run_relative_path
-                and not artifact_list[0].is_dir
-            ):
-                return []
-            for output_file in artifact_list:
-                file_rel_path = posixpath.relpath(
-                    path=output_file.path, start=self.run_relative_artifact_repo_root_path
-                )
-                artifact_size = None if output_file.is_dir else output_file.file_size
-                infos.append(FileInfo(file_rel_path, output_file.is_dir, artifact_size))
-            if len(artifact_list) == 0 or not response.next_page_token:
-                break
-            page_token = response.next_page_token
-        return infos
+    def list_artifacts(self, path: str | None = None) -> list[FileInfo]:
+        return self.resource.list_artifacts(path)
 
     def delete_artifacts(self, artifact_path=None):
         raise MlflowException("Not implemented yet")

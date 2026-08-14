@@ -14,6 +14,7 @@ import { getLatestMetrics, getMinMetrics, getMaxMetrics } from '../reducers/Metr
 import Utils from '../../common/utils/Utils';
 import { Link } from '../../common/utils/RoutingUtils';
 import Routes from '../routes';
+import type { RunInfoEntity } from '../types';
 
 const maxTableHeight = 300;
 // Because we make the table body scrollable, column widths must be fixed
@@ -50,9 +51,7 @@ class MetricsSummaryTable extends React.Component<MetricsSummaryTableProps> {
       {
         title: intl.formatMessage({
           defaultMessage: 'Metric',
-          description:
-            // eslint-disable-next-line max-len
-            'Column title for the column displaying the metric names for a run',
+          description: 'Column title for the column displaying the metric names for a run',
         }),
         dataIndex: 'metricKey',
         sorter: (a: any, b: any) => (a.metricKey < b.metricKey ? -1 : a.metricKey > b.metricKey ? 1 : 0),
@@ -76,9 +75,7 @@ class MetricsSummaryTable extends React.Component<MetricsSummaryTableProps> {
       {
         title: intl.formatMessage({
           defaultMessage: 'Run',
-          description:
-            // eslint-disable-next-line max-len
-            'Column title for the column displaying the run names for a metric',
+          description: 'Column title for the column displaying the run names for a metric',
         }),
         dataIndex: 'runLink',
         sorter: (a: any, b: any) => (a.runName < b.runName ? -1 : a.runName > b.runName ? 1 : 0),
@@ -159,7 +156,14 @@ const getMetricValuesByRun = (
     const runName = runDisplayNames[runIdx];
     return {
       runName: runName,
-      runLink: <Link to={Routes.getRunPageRoute(runExperimentIds[runUuid] || '', runUuid)}>{runName}</Link>,
+      runLink: (
+        <Link
+          componentId="mlflow.experiment_tracking.metrics_summary.run_link"
+          to={Routes.getRunPageRoute(runExperimentIds[runUuid] || '', runUuid)}
+        >
+          {runName}
+        </Link>
+      ),
       key: runUuid,
       ...rowData(runUuid, metricKey, latestMetrics, minMetrics, maxMetrics, intl),
     };
@@ -237,9 +241,9 @@ const mapStateToProps = (state: any, ownProps: any) => {
   const minMetrics = {};
   const maxMetrics = {};
   runUuids.forEach((runUuid: any) => {
-    const runInfo = getRunInfo(runUuid, state);
+    const runInfo = getRunInfo(runUuid, state) as RunInfoEntity;
     // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-    runExperimentIds[runUuid] = runInfo && runInfo.getExperimentId();
+    runExperimentIds[runUuid] = runInfo && runInfo.experimentId;
     // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
     latestMetrics[runUuid] = getLatestMetrics(runUuid, state);
     // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
@@ -251,6 +255,6 @@ const mapStateToProps = (state: any, ownProps: any) => {
 };
 
 // @ts-expect-error TS(2769): No overload matches this call.
-export const MetricsSummaryTableWithIntl = injectIntl(MetricsSummaryTable);
+const MetricsSummaryTableWithIntl = injectIntl(MetricsSummaryTable);
 
 export default connect(mapStateToProps)(MetricsSummaryTableWithIntl);

@@ -1,4 +1,6 @@
+import { useReactTable_unverifiedWithReact18 as useReactTable } from '@databricks/web-shared/react-table';
 import {
+  ModelsIcon,
   SearchIcon,
   Table,
   TableCell,
@@ -8,21 +10,26 @@ import {
   Empty,
   PlusIcon,
   TableSkeletonRows,
+  Typography,
+  WarningIcon,
 } from '@databricks/design-system';
-import { Interpolation, Theme } from '@emotion/react';
-import { ColumnDef, flexRender, getCoreRowModel, SortingState, useReactTable } from '@tanstack/react-table';
+import type { Interpolation, Theme } from '@emotion/react';
+import type { ColumnDef, SortingState } from '@tanstack/react-table';
+import { flexRender, getCoreRowModel } from '@tanstack/react-table';
 import { useMemo } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { Link } from '../../../common/utils/RoutingUtils';
 import { ModelListTagsCell, ModelListVersionLinkCell } from './ModelTableCellRenderers';
-import { RegisteringModelDocUrl } from '../../../common/constants';
+import { RegisteringModelDocUrl, ModelRegistryDocUrl } from '../../../common/constants';
 import Utils from '../../../common/utils/Utils';
-import type { KeyValueEntity, ModelEntity, ModelVersionInfoEntity } from '../../../experiment-tracking/types';
+import type { ModelEntity, ModelVersionInfoEntity } from '../../../experiment-tracking/types';
+import type { KeyValueEntity } from '../../../common/types';
 import { Stages } from '../../constants';
 import { ModelRegistryRoutes } from '../../routes';
 import { CreateModelButton } from '../CreateModelButton';
 import { ModelsTableAliasedVersionsCell } from '../aliases/ModelsTableAliasedVersionsCell';
 import { useNextModelsUIContext } from '../../hooks/useNextModelsUI';
+import { ErrorWrapper } from '../../../common/utils/ErrorWrapper';
 
 const getLatestVersionNumberByStage = (latestVersions: ModelVersionInfoEntity[], stage: string) => {
   const modelVersion = latestVersions && latestVersions.find((v) => v.current_stage === stage);
@@ -46,11 +53,13 @@ export interface ModelListTableProps {
   orderByKey: string;
   orderByAsc: boolean;
   isLoading: boolean;
+  error?: Error;
   isFiltered: boolean;
   onSortChange: (params: { orderByKey: string; orderByAsc: boolean }) => void;
 }
 
-type ModelsColumnDef = ColumnDef<ModelEntity> & {
+type EnrichedModelEntity = ModelEntity;
+type ModelsColumnDef = ColumnDef<EnrichedModelEntity> & {
   // Our experiments column definition houses style definitions in the metadata field
   meta?: { styles?: Interpolation<Theme> };
 };
@@ -61,12 +70,17 @@ export const ModelListTable = ({
   orderByKey,
   onSortChange,
   isLoading,
+  error,
   isFiltered,
   pagination,
 }: ModelListTableProps) => {
   const intl = useIntl();
 
   const { usingNextModelsUI } = useNextModelsUIContext();
+
+  const enrichedModelsData: EnrichedModelEntity[] = modelsData.map((model) => {
+    return model;
+  });
 
   const tableColumns = useMemo(() => {
     const columns: ModelsColumnDef[] = [
@@ -78,9 +92,15 @@ export const ModelListTable = ({
           description: 'Column title for model name in the registered model page',
         }),
         accessorKey: 'name',
+        // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
         cell: ({ getValue }) => (
-          <Link to={ModelRegistryRoutes.getModelPageRoute(String(getValue()))}>
-            <Tooltip title={getValue()}>{getValue()}</Tooltip>
+          <Link
+            componentId="mlflow.model_registry.model_list.model_name_link"
+            to={ModelRegistryRoutes.getModelPageRoute(String(getValue()))}
+          >
+            <Tooltip componentId="mlflow.model-registry.model-list.model-name.tooltip" content={getValue()}>
+              <span>{getValue()}</span>
+            </Tooltip>
           </Link>
         ),
         meta: { styles: { minWidth: 200, flex: 1 } },
@@ -94,6 +114,7 @@ export const ModelListTable = ({
           description: 'Column title for latest model version in the registered model page',
         }),
         accessorKey: 'latest_versions',
+        // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
         cell: ({ getValue, row: { original } }) => {
           const { name } = original;
           const latestVersions = getValue() as ModelVersionInfoEntity[];
@@ -116,6 +137,7 @@ export const ModelListTable = ({
           defaultMessage: 'Aliased versions',
           description: 'Column title for aliased versions in the registered model page',
         }),
+        // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
         cell: ({ row: { original: modelEntity } }) => {
           return <ModelsTableAliasedVersionsCell model={modelEntity} />;
         },
@@ -132,6 +154,7 @@ export const ModelListTable = ({
             defaultMessage: 'Staging',
             description: 'Column title for staging phase version in the registered model page',
           }),
+          // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
           cell: ({ row: { original } }) => {
             const { latest_versions, name } = original;
             const versionNumber = getLatestVersionNumberByStage(latest_versions, Stages.STAGING);
@@ -147,6 +170,7 @@ export const ModelListTable = ({
             defaultMessage: 'Production',
             description: 'Column title for production phase version in the registered model page',
           }),
+          // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
           cell: ({ row: { original } }) => {
             const { latest_versions, name } = original;
             const versionNumber = getLatestVersionNumberByStage(latest_versions, Stages.PRODUCTION);
@@ -166,7 +190,10 @@ export const ModelListTable = ({
         }),
         accessorKey: 'user_id',
         enableSorting: false,
-        cell: ({ getValue }) => <span title={getValue() as string}>{getValue()}</span>,
+        // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
+        cell: ({ getValue, row: { original } }) => {
+          return <span title={getValue() as string}>{getValue()}</span>;
+        },
         meta: { styles: { flex: 1 } },
       },
       {
@@ -177,7 +204,8 @@ export const ModelListTable = ({
           description: 'Column title for last modified timestamp for a model in the registered model page',
         }),
         accessorKey: 'last_updated_timestamp',
-        cell: ({ getValue }) => <span>{Utils.formatTimestamp(getValue())}</span>,
+        // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
+        cell: ({ getValue }) => <span>{Utils.formatTimestamp(getValue(), intl)}</span>,
         meta: { styles: { flex: 1, maxWidth: 150 } },
       },
       {
@@ -188,6 +216,7 @@ export const ModelListTable = ({
         }),
         enableSorting: false,
         accessorKey: 'tags',
+        // eslint-disable-next-line @databricks/no-unstable-nested-components -- go/no-nested-components
         cell: ({ getValue }) => {
           return <ModelListTagsCell tags={getValue() as KeyValueEntity[]} />;
         },
@@ -195,11 +224,7 @@ export const ModelListTable = ({
     );
 
     return columns;
-  }, [
-    // prettier-ignore
-    intl,
-    usingNextModelsUI,
-  ]);
+  }, [intl, usingNextModelsUI]);
 
   const sorting: SortingState = [{ id: orderByKey, desc: !orderByAsc }];
 
@@ -221,49 +246,73 @@ export const ModelListTable = ({
       />
     );
   })();
-  const emptyComponent = isFiltered ? (
+  const emptyComponent = error ? (
+    <div css={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 400 }}>
+      <Empty
+        image={<WarningIcon />}
+        description={error instanceof ErrorWrapper ? error.getMessageField() : error.message}
+        title={
+          <FormattedMessage
+            defaultMessage="Error fetching models"
+            description="Workspace models page > Error empty state title"
+          />
+        }
+      />
+    </div>
+  ) : isFiltered ? (
     // Displayed when there is no results, but any filters have been applied
-    <Empty description={noResultsDescription} image={<SearchIcon />} data-testid="model-list-no-results" />
+    <div css={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 400 }}>
+      <Empty description={noResultsDescription} image={<SearchIcon />} data-testid="model-list-no-results" />
+    </div>
   ) : (
     // Displayed when there is no results with no filters applied
-    <Empty
-      description={
-        <FormattedMessage
-          defaultMessage="No models registered yet. <link>Learn more about registering models</link>."
-          description="Models table > no models present yet"
-          values={{
-            link: (content: any) => (
-              <a target="_blank" rel="noopener noreferrer" href={registerModelDocUrl}>
-                {content}
-              </a>
-            ),
-          }}
-        />
-      }
-      image={<PlusIcon />}
-      button={
-        <CreateModelButton
-          buttonType="primary"
-          buttonText={
-            <FormattedMessage defaultMessage="Create a model" description="Create button to register a new model" />
-          }
-        />
-      }
-    />
+    <div css={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: 400 }}>
+      <Empty
+        description={
+          <FormattedMessage
+            defaultMessage="Share and manage machine learning models. <link>Learn more</link>"
+            description="Models table > no models present yet"
+            values={{
+              link: (content: any) => (
+                <Typography.Link
+                  componentId="codegen_mlflow_app_src_model-registry_components_model-list_modellisttable.tsx_learn_more"
+                  href={ModelRegistryDocUrl}
+                  openInNewTab
+                >
+                  {content}
+                </Typography.Link>
+              ),
+            }}
+          />
+        }
+        image={<ModelsIcon />}
+        button={
+          <CreateModelButton
+            buttonType="primary"
+            buttonText={
+              <FormattedMessage defaultMessage="Create model" description="Create button to register a new model" />
+            }
+          />
+        }
+      />
+    </div>
   );
 
-  const isEmpty = () => !isLoading && table.getRowModel().rows.length === 0;
+  const isEmpty = () => (!isLoading && table.getRowModel().rows.length === 0) || error;
 
-  const table = useReactTable<ModelEntity>({
-    data: modelsData,
-    columns: tableColumns,
-    state: {
-      sorting,
+  const table = useReactTable<EnrichedModelEntity>(
+    'mlflow/server/js/src/model-registry/components/model-list/ModelListTable.tsx',
+    {
+      data: enrichedModelsData,
+      columns: tableColumns,
+      state: {
+        sorting,
+      },
+      getCoreRowModel: getCoreRowModel(),
+      getRowId: ({ id }) => id,
+      onSortingChange: setSorting,
     },
-    getCoreRowModel: getCoreRowModel(),
-    getRowId: ({ id }) => id,
-    onSortingChange: setSorting,
-  });
+  );
 
   return (
     <>
@@ -276,6 +325,7 @@ export const ModelListTable = ({
         <TableRow isHeader>
           {table.getLeafHeaders().map((header) => (
             <TableHeader
+              componentId="codegen_mlflow_app_src_model-registry_components_model-list_modellisttable.tsx_412"
               ellipsis
               key={header.id}
               sortable={header.column.getCanSort()}

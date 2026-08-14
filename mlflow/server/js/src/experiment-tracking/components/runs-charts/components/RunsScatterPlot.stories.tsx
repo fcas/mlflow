@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
-import { RunInfoEntity } from '../../../types';
+import type { RunInfoEntity } from '../../../types';
 import {
   chartColors,
   ChartStoryWrapper,
@@ -7,7 +7,8 @@ import {
   stableNormalRandom,
   useControls,
 } from './RunsCharts.stories-common';
-import { RunsScatterPlot, RunsScatterPlotProps } from './RunsScatterPlot';
+import type { RunsScatterPlotProps } from './RunsScatterPlot';
+import { RunsScatterPlot } from './RunsScatterPlot';
 
 export default {
   title: 'Runs charts/Scatter plot',
@@ -26,8 +27,8 @@ const createMockContourData = (numRuns: number): RunsScatterPlotProps['runsData'
       uuid: `id-for-run-${runName}`,
       displayName: runName,
       runInfo: {
-        run_uuid: `id-for-run-${runName}`,
-        run_name: runName,
+        runUuid: `id-for-run-${runName}`,
+        runName: runName,
       } as RunInfoEntity,
       metrics: {
         metric1: { key: 'metric1', value: Math.abs(500 * random() - 250) },
@@ -39,6 +40,8 @@ const createMockContourData = (numRuns: number): RunsScatterPlotProps['runsData'
         param2: { key: 'param2', value: Math.abs(500 * random() - 250) },
         param3: { key: 'param3', value: Math.abs(500 * random() - 250) },
       } as any,
+      tags: {} as any,
+      images: {} as any,
       color: chartColors[index % chartColors.length],
     };
   });

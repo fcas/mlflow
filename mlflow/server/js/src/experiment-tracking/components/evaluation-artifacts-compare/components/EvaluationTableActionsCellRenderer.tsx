@@ -26,8 +26,9 @@ export const EvaluationTableActionsCellRenderer = ({
       }}
     >
       <Tooltip
-        placement="right"
-        title={
+        componentId="mlflow.experiment-tracking.evaluation-table-actions.add-row"
+        side="right"
+        content={
           <FormattedMessage
             defaultMessage="Add row"
             description="Experiment page > artifact compare view > add new row button"

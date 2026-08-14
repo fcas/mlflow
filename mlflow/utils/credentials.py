@@ -2,7 +2,7 @@ import configparser
 import getpass
 import logging
 import os
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple
 
 from mlflow.environment_variables import (
     MLFLOW_TRACKING_AUTH,
@@ -21,15 +21,15 @@ _logger = logging.getLogger(__name__)
 
 
 class MlflowCreds(NamedTuple):
-    username: Optional[str]
-    password: Optional[str]
+    username: str | None
+    password: str | None
 
 
 def _get_credentials_path() -> str:
     return os.path.expanduser("~/.mlflow/credentials")
 
 
-def _read_mlflow_creds_from_file() -> Tuple[Optional[str], Optional[str]]:
+def _read_mlflow_creds_from_file() -> tuple[str | None, str | None]:
     path = _get_credentials_path()
     if not os.path.exists(path):
         return None, None
@@ -45,7 +45,7 @@ def _read_mlflow_creds_from_file() -> Tuple[Optional[str], Optional[str]]:
     return mlflow_cfg.get(username_key), mlflow_cfg.get(password_key)
 
 
-def _read_mlflow_creds_from_env() -> Tuple[Optional[str], Optional[str]]:
+def _read_mlflow_creds_from_env() -> tuple[str | None, str | None]:
     return MLFLOW_TRACKING_USERNAME.get(), MLFLOW_TRACKING_PASSWORD.get()
 
 
@@ -84,9 +84,18 @@ def login(backend: str = "databricks", interactive: bool = True) -> None:
         backend: string, the backend of the tracking server. Currently only "databricks" is
             supported.
 
-        interacive: bool, controls request for user input on missing credentials. If true, user
+        interactive: bool, controls request for user input on missing credentials. If true, user
             input will be requested if no credentials are found, otherwise an exception will be
             raised if no credentials are found.
+
+    .. note::
+        When credentials resolve from ``~/.databrickscfg`` (rather than from environment
+        variables, OIDC, the Azure CLI, or another unified-auth source), this function uses
+        the ``DEFAULT`` profile, or the profile named by the ``DATABRICKS_CONFIG_PROFILE``
+        environment variable. If you have multiple named profiles, for example one created
+        by ``databricks auth login`` (which names the profile after the workspace host, not
+        ``DEFAULT``), set ``DATABRICKS_CONFIG_PROFILE=<name>`` before calling this function,
+        or call ``mlflow.set_tracking_uri("databricks://<name>")`` explicitly.
 
     .. code-block:: python
         :caption: Example

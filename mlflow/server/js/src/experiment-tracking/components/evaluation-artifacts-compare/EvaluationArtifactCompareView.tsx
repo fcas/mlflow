@@ -7,7 +7,7 @@ import {
   DialogComboboxOptionListSelectItem,
   DialogComboboxTrigger,
   Empty,
-  InfoIcon,
+  InfoSmallIcon,
   Input,
   SearchIcon,
   LegacySkeleton,
@@ -20,19 +20,19 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import type { EvaluationDataReduxState } from '../../reducers/EvaluationDataReducer';
-import { SearchExperimentRunsViewState } from '../experiment-page/models/SearchExperimentRunsViewState';
-import { RunRowType } from '../experiment-page/utils/experimentPage.row-types';
+import type { ExperimentPageViewState } from '../experiment-page/models/ExperimentPageViewState';
+import type { RunRowType } from '../experiment-page/utils/experimentPage.row-types';
 import { EvaluationArtifactCompareTable } from './components/EvaluationArtifactCompareTable';
 import { useEvaluationArtifactColumns } from './hooks/useEvaluationArtifactColumns';
 import { useEvaluationArtifactTableData } from './hooks/useEvaluationArtifactTableData';
 import { useEvaluationArtifactTables } from './hooks/useEvaluationArtifactTables';
-import type { RunDatasetWithTags, UpdateExperimentSearchFacetsFn, UpdateExperimentViewStateFn } from '../../types';
+import type { RunDatasetWithTags, UpdateExperimentViewStateFn } from '../../types';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { PreviewSidebar } from '../../../common/components/PreviewSidebar';
 import { useEvaluationArtifactViewState } from './hooks/useEvaluationArtifactViewState';
 import { useEvaluationArtifactWriteBack } from './hooks/useEvaluationArtifactWriteBack';
 import { PromptEngineeringContextProvider } from './contexts/PromptEngineeringContext';
-import { ReduxState, ThunkDispatch } from '../../../redux-types';
+import type { ReduxState, ThunkDispatch } from '../../../redux-types';
 import { getEvaluationTableArtifact } from '../../actions';
 import Utils from '../../../common/utils/Utils';
 import {
@@ -41,34 +41,38 @@ import {
   extractRequiredInputParamsForRun,
 } from '../prompt-engineering/PromptEngineering.utils';
 import { searchAllPromptLabAvailableEndpoints } from '../../actions/PromptEngineeringActions';
-import { shouldEnablePromptLab } from 'common/utils/FeatureUtils';
+import { shouldEnablePromptLab } from '@mlflow/mlflow/src/common/utils/FeatureUtils';
 import {
   EvaluationArtifactViewEmptyState,
   shouldDisplayEvaluationArtifactEmptyState,
 } from './EvaluationArtifactViewEmptyState';
+import { useUpdateExperimentViewUIState } from '../experiment-page/contexts/ExperimentPageUIStateContext';
+import { useToggleRowVisibilityCallback } from '../experiment-page/hooks/useToggleRowVisibilityCallback';
+import { RUNS_VISIBILITY_MODE } from '../experiment-page/models/ExperimentPageUIState';
+import { FormattedJsonDisplay } from '@mlflow/mlflow/src/common/components/JsonFormatting';
+import { EvaluationTableParseError } from '../../sdk/EvaluationArtifactService';
 
 const MAX_RUNS_TO_COMPARE = 10;
 
 interface EvaluationArtifactCompareViewProps {
   comparedRuns: RunRowType[];
-  viewState: SearchExperimentRunsViewState;
+  viewState: ExperimentPageViewState;
   updateViewState: UpdateExperimentViewStateFn;
-  updateSearchFacets: UpdateExperimentSearchFacetsFn;
   onDatasetSelected: (dataset: RunDatasetWithTags, run: RunRowType) => void;
 }
 
 /**
  * Compares the table data contained in experiment run artifacts.
  */
-export const EvaluationArtifactCompareViewImpl = ({
+const EvaluationArtifactCompareViewImpl = ({
   comparedRuns,
-  updateSearchFacets,
   onDatasetSelected,
   viewState,
   updateViewState,
 }: EvaluationArtifactCompareViewProps) => {
   const intl = useIntl();
   const { theme } = useDesignSystemTheme();
+  const updateUIState = useUpdateExperimentViewUIState();
 
   const visibleRuns = useMemo(
     () => comparedRuns.filter(({ hidden }) => !hidden).slice(0, MAX_RUNS_TO_COMPARE),
@@ -144,7 +148,13 @@ export const EvaluationArtifactCompareViewImpl = ({
     );
   });
 
-  const { columns } = useEvaluationArtifactColumns(evaluationArtifactsByRunUuid, visibleRunsUuids, selectedTables);
+  const { columns, imageColumns } = useEvaluationArtifactColumns(
+    evaluationArtifactsByRunUuid,
+    visibleRunsUuids,
+    selectedTables,
+  );
+
+  const isImageColumn = imageColumns.includes(outputColumn);
 
   const tableRows = useEvaluationArtifactTableData(
     evaluationArtifactsByRunUuid,
@@ -192,7 +202,12 @@ export const EvaluationArtifactCompareViewImpl = ({
       const tablesToFetch = (tablesByRun[run.runUuid] || []).filter((table) => selectedTables.includes(table));
       for (const table of tablesToFetch) {
         dispatch(getEvaluationTableArtifact(run.runUuid, table, false)).catch((e) => {
-          Utils.logErrorAndNotifyUser(e.message || e);
+          if (e instanceof EvaluationTableParseError) {
+            // In case of table parse errors, just display the error to the user without propagating it upstream
+            Utils.displayGlobalErrorNotification(e.message);
+          } else {
+            Utils.logErrorAndNotifyUser(e.message || e);
+          }
         });
       }
     }
@@ -204,22 +219,24 @@ export const EvaluationArtifactCompareViewImpl = ({
   const isViewConfigured = !isLoading && areTablesSelected && areRunsSelected;
 
   const filteredRows = useMemo(() => {
-    if (!debouncedFilter.trim()) {
+    const trimmedFilterLowerCase = debouncedFilter.trim().toLowerCase();
+    if (!trimmedFilterLowerCase) {
       return tableRows;
     }
-    const regexp = new RegExp(debouncedFilter, 'i');
     return tableRows.filter(({ groupByCellValues }) =>
-      Object.values(groupByCellValues).some((groupByValue) => groupByValue?.match(regexp)),
+      Object.values(groupByCellValues).some((groupByValue) =>
+        groupByValue?.toLowerCase().includes(trimmedFilterLowerCase),
+      ),
     );
   }, [tableRows, debouncedFilter]);
 
+  const toggleRowVisibility = useToggleRowVisibilityCallback(comparedRuns);
+
   const handleHideRun = useCallback(
-    (runUuid: string) =>
-      updateSearchFacets((existingFacets) => ({
-        ...existingFacets,
-        runsHidden: [...existingFacets.runsHidden, runUuid],
-      })),
-    [updateSearchFacets],
+    (runUuid: string) => {
+      toggleRowVisibility(RUNS_VISIBILITY_MODE.CUSTOM, runUuid);
+    },
+    [toggleRowVisibility],
   );
 
   // Make sure that there's at least one "group by" column selected
@@ -254,8 +271,8 @@ export const EvaluationArtifactCompareViewImpl = ({
   // All columns that are not used for grouping can be used as output (compare) column
   // Remove MLFLOW_ columns from the list of output columns
   const availableOutputColumns = useMemo(
-    () => columns.filter((col) => !groupByCols.includes(col) && !col.startsWith('MLFLOW_')),
-    [columns, groupByCols],
+    () => [...columns, ...imageColumns].filter((col) => !groupByCols.includes(col) && !col.startsWith('MLFLOW_')),
+    [columns, imageColumns, groupByCols],
   );
 
   // If the current output column have been selected as "group by", change it to the other available one
@@ -313,6 +330,7 @@ export const EvaluationArtifactCompareViewImpl = ({
   return (
     <div
       css={{
+        flex: 1,
         borderTop: `1px solid ${theme.colors.border}`,
         borderLeft: `1px solid ${theme.colors.border}`,
         // Let's cover 1 pixel of the grid's border for the sleek look
@@ -346,6 +364,7 @@ export const EvaluationArtifactCompareViewImpl = ({
           }}
         >
           <DialogCombobox
+            componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_evaluationartifactcompareview.tsx_358"
             label={
               <FormattedMessage
                 defaultMessage="Table"
@@ -378,14 +397,17 @@ export const EvaluationArtifactCompareViewImpl = ({
             </DialogComboboxContent>
           </DialogCombobox>
           <Tooltip
-            title={
+            componentId="mlflow.experiment-tracking.evaluation-artifact-compare.run-header"
+            content={
               <FormattedMessage
                 defaultMessage="Using the list of logged table artifacts, select at least one to start comparing results."
                 description="Experiment page > artifact compare view > table select dropdown tooltip"
               />
             }
           >
-            <InfoIcon />
+            <span>
+              <InfoSmallIcon />
+            </span>
           </Tooltip>
         </div>
         {isLoading ? (
@@ -402,6 +424,7 @@ export const EvaluationArtifactCompareViewImpl = ({
               }}
             >
               <Input
+                componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_evaluationartifactcompareview.tsx_414"
                 prefix={<SearchIcon />}
                 suffix={showSearchSpinner && <Spinner size="small" />}
                 css={{ width: 300, minWidth: 300 }}
@@ -420,6 +443,7 @@ export const EvaluationArtifactCompareViewImpl = ({
                 disabled={!isViewConfigured || isSyncingArtifacts}
               />
               <DialogCombobox
+                componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_evaluationartifactcompareview.tsx_433"
                 value={groupByCols}
                 multiSelect
                 label={
@@ -452,6 +476,7 @@ export const EvaluationArtifactCompareViewImpl = ({
                 </DialogComboboxContent>
               </DialogCombobox>
               <DialogCombobox
+                componentId="codegen_mlflow_app_src_experiment-tracking_components_evaluation-artifacts-compare_evaluationartifactcompareview.tsx_465"
                 value={[outputColumn]}
                 label={
                   <FormattedMessage
@@ -518,12 +543,13 @@ export const EvaluationArtifactCompareViewImpl = ({
                     visibleRuns={visibleRuns}
                     groupByColumns={groupByCols}
                     resultList={filteredRows}
-                    onCellClick={handleCellClicked}
+                    onCellClick={isImageColumn ? undefined : handleCellClicked}
                     onHideRun={handleHideRun}
                     onDatasetSelected={onDatasetSelected}
                     highlightedText={debouncedFilter.trim()}
                     isPreviewPaneVisible={viewState.previewPaneVisible}
                     outputColumnName={outputColumn}
+                    isImageColumn={isImageColumn}
                   />
                 </PromptEngineeringContextProvider>
               </div>
@@ -534,8 +560,8 @@ export const EvaluationArtifactCompareViewImpl = ({
       </div>
       {viewState.previewPaneVisible && (
         <PreviewSidebar
-          content={sidebarPreviewData?.value}
-          copyText={sidebarPreviewData?.value}
+          content={sidebarPreviewData?.value ? <FormattedJsonDisplay json={sidebarPreviewData.value} /> : null}
+          copyText={sidebarPreviewData?.value || ''}
           headerText={sidebarPreviewData?.header}
           onClose={() => updateViewState({ previewPaneVisible: false })}
           empty={
@@ -560,6 +586,7 @@ export const EvaluationArtifactCompareView = (props: EvaluationArtifactCompareVi
     return (
       <div
         css={{
+          flex: 1,
           backgroundColor: theme.colors.backgroundSecondary,
           height: '100%',
           borderTop: `1px solid ${theme.colors.border}`,

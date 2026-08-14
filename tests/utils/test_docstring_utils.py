@@ -1,13 +1,22 @@
-from mlflow.utils.docstring_utils import ParamDocs, _indent, format_docstring
+import warnings
+
+from mlflow.utils.docstring_utils import (
+    ParamDocs,
+    _indent,
+    docstring_version_compatibility_warning,
+    format_docstring,
+)
 
 
 def test_indent_empty():
-    a, b = "", " " * 4
+    a = ""
+    b = " " * 4
     assert _indent(a, b) == a
 
 
 def test_indent_single_line():
-    a, b = "x", " " * 4
+    a = "x"
+    b = " " * 4
     assert _indent(a, b) == a
 
 
@@ -27,14 +36,12 @@ def test_param_docs_format():
 
 
 def test_param_docs_format_no_changes():
-    @format_docstring(
-        {
-            "multi_line": """Single line
+    @format_docstring({
+        "multi_line": """Single line
 Another line\n    Another indented line""",
-            "single_line": "hi",
-        }
-    )
-    def f():
+        "single_line": "hi",
+    })
+    def f(p1, p2, p3, p4):
         """asdf
 
         Args:
@@ -64,15 +71,13 @@ Another line\n    Another indented line""",
 
 
 def test_param_docs_format_google():
-    @format_docstring(
-        {
-            "multi_line": """Single line
+    @format_docstring({
+        "multi_line": """Single line
 Another line\n    Another indented line""",
-            "single_line": "hi",
-        }
-    )
+        "single_line": "hi",
+    })
     # fmt: off
-    def f():
+    def f(p1, p2, p3, p4):
         """asdf
 
         Args:
@@ -107,13 +112,11 @@ Another line\n    Another indented line""",
 
 
 def test_param_docs_format_not_google():
-    @format_docstring(
-        {
-            "multi_line": """Single line
+    @format_docstring({
+        "multi_line": """Single line
 Another line\n    Another indented line""",
-            "single_line": "hi",
-        }
-    )
+        "single_line": "hi",
+    })
     # fmt: off
     def f():
         """
@@ -145,3 +148,26 @@ Another line\n    Another indented line""",
 
     assert f.__doc__ == expected
     assert f.__name__ == "f"
+
+
+def test_docstring_version_compatibility_warning():
+    @docstring_version_compatibility_warning("sklearn")
+    def func():
+        pass
+
+    @docstring_version_compatibility_warning("sklearn")
+    def another_func():
+        func()
+
+    with warnings.catch_warnings(record=True) as w:
+        func()
+
+    # Exclude irrelevant warnings
+    warns = [x for x in w if "MLflow Models integration is known to be compatible" in str(x)]
+    assert len(warns) == 0
+
+    with warnings.catch_warnings(record=True) as w:
+        another_func()
+
+    warns = [x for x in w if "MLflow Models integration is known to be compatible" in str(x)]
+    assert len(warns) == 0

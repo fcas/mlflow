@@ -1,11 +1,13 @@
-import { DeepPartial } from 'redux';
-import { renderWithIntl, act, screen } from 'common/utils/TestUtils.react18';
-import { RunDatasetWithTags, RunInfoEntity } from '../../../types';
+import { jest, describe, test, expect } from '@jest/globals';
+import type { DeepPartial } from 'redux';
+import { renderWithIntl, act, screen } from '@mlflow/mlflow/src/common/utils/TestUtils.react18';
+import type { RunDatasetWithTags, RunInfoEntity } from '../../../types';
 import { RunViewDatasetBox } from './RunViewDatasetBox';
-import userEvent from '@testing-library/user-event-14';
+import userEvent from '@testing-library/user-event';
 import { openDropdownMenu } from '@databricks/design-system/test-utils/rtl';
 import { ExperimentViewDatasetDrawer } from '../../experiment-page/components/runs/ExperimentViewDatasetDrawer';
 import { DesignSystemProvider } from '@databricks/design-system';
+import { MemoryRouter, Route, Routes } from '@mlflow/mlflow/src/common/utils/RoutingUtils';
 jest.mock('../../experiment-page/components/runs/ExperimentViewDatasetDrawer', () => ({
   ExperimentViewDatasetDrawer: jest.fn(() => <div />),
 }));
@@ -15,10 +17,10 @@ const testRunName = 'Test run name';
 const testExperimentId = '12345';
 
 const testRunInfo = {
-  experiment_id: testExperimentId,
-  lifecycle_stage: 'active',
-  run_name: testRunName,
-  run_uuid: testRunUuid,
+  experimentId: testExperimentId,
+  lifecycleStage: 'active',
+  runName: testRunName,
+  runUuid: testRunUuid,
 } as RunInfoEntity;
 
 const testTags = { testTag: { key: 'testTag', value: 'xyz' } } as any;
@@ -56,6 +58,7 @@ describe('RunViewDatasetBox', () => {
           datasetWithTags: testDatasetWithTags,
         }),
       }),
+      // @ts-expect-error Expected 1 arguments, but got 2
       {},
     );
   });
@@ -98,7 +101,40 @@ describe('RunViewDatasetBox', () => {
           datasetWithTags: evalDataset,
         }),
       }),
+      // @ts-expect-error Expected 1 arguments, but got 2
       {},
     );
+  });
+
+  test('Evaluation dataset links directly to the dataset detail page instead of opening the drawer', async () => {
+    jest.mocked(ExperimentViewDatasetDrawer).mockClear();
+    const evalDataset = {
+      tags: [],
+      dataset: {
+        digest: 'ev123',
+        name: 'eval_dataset',
+        sourceType: 'mlflow_evaluation_dataset',
+        source: JSON.stringify({ dataset_id: 'd-eval-123' }),
+      },
+    };
+    renderWithIntl(
+      <DesignSystemProvider>
+        <MemoryRouter initialEntries={['/experiments/12345/runs/test-run-uuid']}>
+          <Routes>
+            <Route
+              path="/experiments/:experimentId/runs/:runUuid"
+              element={<RunViewDatasetBox runInfo={testRunInfo} datasets={[evalDataset] as any} tags={testTags} />}
+            />
+          </Routes>
+        </MemoryRouter>
+      </DesignSystemProvider>,
+    );
+
+    const link = screen.getByRole('link', { name: /eval_dataset/ });
+    // Links straight to the dataset detail (dataset id carried in the query param), not the drawer
+    expect(link.getAttribute('href')).toContain('d-eval-123');
+
+    await userEvent.click(link);
+    expect(ExperimentViewDatasetDrawer).not.toHaveBeenCalled();
   });
 });

@@ -1,48 +1,23 @@
 import inspect
 import logging
 import sys
-import time
-from functools import wraps
 
 import transformers
 from packaging.version import Version
 
-from mlflow.transformers import _PEFT_PIPELINE_ERROR_MSG
+from mlflow.transformers import _PEFT_PIPELINE_ERROR_MSG, _try_import_conversational_pipeline
 from mlflow.utils.logging_utils import suppress_logs
+
+from tests.helper_functions import flaky
+from tests.transformers.version import (
+    IS_NEW_FEATURE_EXTRACTION_API,
+    IS_TRANSFORMERS_V5_OR_LATER,
+    transformers_version,
+)
 
 _logger = logging.getLogger(__name__)
 
-transformers_version = Version(transformers.__version__)
-IS_NEW_FEATURE_EXTRACTION_API = transformers_version >= Version("4.27.0")
-
-
-def flaky(max_tries=3):
-    """
-    Annotation decorator for retrying flaky functions up to max_tries times, and raise the Exception
-    if it fails after max_tries attempts.
-
-    Args:
-        max_tries: Maximum number of times to retry the function.
-
-    Returns:
-        Decorated function.
-    """
-
-    def flaky_test_func(test_func):
-        @wraps(test_func)
-        def decorated_func(*args, **kwargs):
-            for i in range(max_tries):
-                try:
-                    return test_func(*args, **kwargs)
-                except Exception as e:
-                    _logger.warning(f"Attempt {i+1} failed with error: {e}")
-                    if i == max_tries - 1:
-                        raise
-                    time.sleep(3)
-
-        return decorated_func
-
-    return flaky_test_func
+CHAT_TEMPLATE = "{% for message in messages %}{{ message.content }}{{ eos_token }}{% endfor %}"
 
 
 def prefetch(func):
@@ -55,16 +30,10 @@ def prefetch(func):
 
 @prefetch
 @flaky()
-def load_small_seq2seq_pipeline():
-    architecture = "lordtt13/emo-mobilebert"
-    tokenizer = transformers.AutoTokenizer.from_pretrained(architecture)
-    model = transformers.TFAutoModelForSequenceClassification.from_pretrained(architecture)
-    return transformers.pipeline(task="text-classification", model=model, tokenizer=tokenizer)
-
-
-@prefetch
-@flaky()
 def load_small_qa_pipeline():
+    if IS_TRANSFORMERS_V5_OR_LATER:
+        _logger.info("Skipping question-answering pipeline prefetch: removed in transformers 5.x")
+        return None
     architecture = "csarron/mobilebert-uncased-squad-v2"
     tokenizer = transformers.AutoTokenizer.from_pretrained(architecture, low_cpu_mem_usage=True)
     model = transformers.MobileBertForQuestionAnswering.from_pretrained(
@@ -77,20 +46,33 @@ def load_small_qa_pipeline():
 @flaky()
 def load_small_vision_model():
     architecture = "google/mobilenet_v2_1.0_224"
-    feature_extractor = transformers.AutoFeatureExtractor.from_pretrained(
-        architecture, low_cpu_mem_usage=True
-    )
     model = transformers.MobileNetV2ForImageClassification.from_pretrained(
         architecture, low_cpu_mem_usage=True
     )
-    return transformers.pipeline(
-        task="image-classification", model=model, feature_extractor=feature_extractor
-    )
+    if IS_NEW_FEATURE_EXTRACTION_API:
+        image_processor = transformers.AutoImageProcessor.from_pretrained(
+            architecture, low_cpu_mem_usage=True
+        )
+        return transformers.pipeline(
+            task="image-classification", model=model, image_processor=image_processor
+        )
+    else:
+        feature_extractor = transformers.AutoFeatureExtractor.from_pretrained(
+            architecture, low_cpu_mem_usage=True
+        )
+        return transformers.pipeline(
+            task="image-classification", model=model, feature_extractor=feature_extractor
+        )
 
 
 @prefetch
 @flaky()
 def load_small_multi_modal_pipeline():
+    if IS_TRANSFORMERS_V5_OR_LATER:
+        _logger.info(
+            "Skipping visual-question-answering pipeline prefetch: removed in transformers 5.x"
+        )
+        return None
     architecture = "dandelin/vilt-b32-finetuned-vqa"
     return transformers.pipeline(model=architecture)
 
@@ -98,6 +80,9 @@ def load_small_multi_modal_pipeline():
 @prefetch
 @flaky()
 def load_component_multi_modal():
+    if IS_TRANSFORMERS_V5_OR_LATER:
+        _logger.info("Skipping VQA component model prefetch: removed in transformers 5.x")
+        return None
     architecture = "dandelin/vilt-b32-finetuned-vqa"
     tokenizer = transformers.BertTokenizerFast.from_pretrained(architecture, low_cpu_mem_usage=True)
     processor = transformers.ViltProcessor.from_pretrained(architecture, low_cpu_mem_usage=True)
@@ -118,13 +103,14 @@ def load_component_multi_modal():
 @prefetch
 @flaky()
 def load_small_conversational_model():
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        "microsoft/DialoGPT-small", low_cpu_mem_usage=True
-    )
-    model = transformers.AutoModelWithLMHead.from_pretrained(
-        "satvikag/chatbot", low_cpu_mem_usage=True
-    )
-    return transformers.pipeline(task="conversational", model=model, tokenizer=tokenizer)
+    if _try_import_conversational_pipeline():
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            "microsoft/DialoGPT-small", low_cpu_mem_usage=True
+        )
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            "satvikag/chatbot", low_cpu_mem_usage=True
+        )
+        return transformers.pipeline(task="conversational", model=model, tokenizer=tokenizer)
 
 
 @prefetch
@@ -139,6 +125,9 @@ def load_fill_mask_pipeline():
 @prefetch
 @flaky()
 def load_text2text_generation_pipeline():
+    if IS_TRANSFORMERS_V5_OR_LATER:
+        _logger.info("Skipping text2text-generation pipeline prefetch: removed in transformers 5.x")
+        return None
     task = "text2text-generation"
     architecture = "mrm8488/t5-small-finetuned-common_gen"
     model = transformers.T5ForConditionalGeneration.from_pretrained(architecture)
@@ -151,14 +140,19 @@ def load_text2text_generation_pipeline():
 def load_text_generation_pipeline():
     task = "text-generation"
     architecture = "distilgpt2"
-    model = transformers.AutoModelWithLMHead.from_pretrained(architecture)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(architecture)
+    model = transformers.AutoModelForCausalLM.from_pretrained(architecture)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        architecture, chat_template=CHAT_TEMPLATE
+    )
     return transformers.pipeline(task=task, model=model, tokenizer=tokenizer)
 
 
 @prefetch
 @flaky()
 def load_translation_pipeline():
+    if IS_TRANSFORMERS_V5_OR_LATER:
+        _logger.info("Skipping translation pipeline prefetch: removed in transformers 5.x")
+        return None
     return transformers.pipeline(
         task="translation_en_to_de",
         model=transformers.T5ForConditionalGeneration.from_pretrained("t5-small"),
@@ -169,6 +163,9 @@ def load_translation_pipeline():
 @prefetch
 @flaky()
 def load_summarizer_pipeline():
+    if IS_TRANSFORMERS_V5_OR_LATER:
+        _logger.info("Skipping summarizer pipeline prefetch: removed in transformers 5.x")
+        return None
     task = "summarization"
     architecture = "sshleifer/distilbart-cnn-6-6"
     model = transformers.BartForConditionalGeneration.from_pretrained(architecture)
@@ -204,7 +201,7 @@ def load_zero_shot_pipeline():
 @flaky()
 def load_table_question_answering_pipeline():
     return transformers.pipeline(
-        task="table-question-answering", model="google/tapas-tiny-finetuned-wtq"
+        task="table-question-answering", model="google/tapas-tiny-finetuned-sqa"
     )
 
 
@@ -229,9 +226,10 @@ def load_ner_pipeline_aggregation():
 @prefetch
 @flaky()
 def load_conversational_pipeline():
-    return transformers.pipeline(
-        model="AVeryRealHuman/DialoGPT-small-TonyStark", task="conversational"
-    )
+    if _try_import_conversational_pipeline():
+        return transformers.pipeline(
+            model="AVeryRealHuman/DialoGPT-small-TonyStark", task="conversational"
+        )
 
 
 @prefetch
@@ -242,8 +240,11 @@ def load_whisper_pipeline():
     model = transformers.WhisperForConditionalGeneration.from_pretrained(architecture)
     tokenizer = transformers.WhisperTokenizer.from_pretrained(architecture)
     feature_extractor = transformers.WhisperFeatureExtractor.from_pretrained(architecture)
-    if Version(transformers.__version__) > Version("4.30.2"):
-        model.generation_config.alignment_heads = [[2, 2], [3, 0], [3, 2], [3, 3], [3, 4], [3, 5]]
+    model.generation_config.alignment_heads = [[2, 2], [3, 0], [3, 2], [3, 3], [3, 4], [3, 5]]
+    if transformers_version > Version("4.49.0"):
+        # forced_decoder_ids is not allowed
+        # ref: https://github.com/huggingface/transformers/blob/6a2627918d84f25422b931507a8fb9146106ca20/src/transformers/generation/utils.py#L1083
+        model.generation_config.forced_decoder_ids = None
     return transformers.pipeline(
         task=task, model=model, tokenizer=tokenizer, feature_extractor=feature_extractor
     )

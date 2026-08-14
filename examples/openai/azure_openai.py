@@ -17,10 +17,10 @@ export OPENAI_DEPLOYMENT_NAME="<AZURE OPENAI DEPLOYMENT ID OR NAME>"
 
 with mlflow.start_run():
     model_info = mlflow.openai.log_model(
-        # Your Azure OpenAI model e.g. gpt-3.5-turbo
+        # Your Azure OpenAI model e.g. gpt-4o-mini
         model="<YOUR AZURE OPENAI MODEL>",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[{"role": "user", "content": "Tell me a joke about {animal}."}],
     )
 
@@ -35,14 +35,12 @@ print(completion["choices"][0]["message"]["content"])
 
 # Load as Pyfunc model
 model = mlflow.pyfunc.load_model(model_info.model_uri)
-df = pd.DataFrame(
-    {
-        "animal": [
-            "cats",
-            "dogs",
-        ]
-    }
-)
+df = pd.DataFrame({
+    "animal": [
+        "cats",
+        "dogs",
+    ]
+})
 print(model.predict(df))
 
 list_of_dicts = [

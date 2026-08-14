@@ -5,10 +5,13 @@
  * annotations are already looking good, please remove this comment.
  */
 
+import type { IntlShape } from 'react-intl';
 import { createIntlCache, createIntl } from 'react-intl';
 import { DEFAULT_LOCALE, loadMessages } from './loadMessages';
 import { useEffect, useState } from 'react';
+import Utils from '../common/utils/Utils';
 
+// eslint-disable-next-line @databricks/no-const-object-record-string -- TODO(FEINF-2058)
 const FALLBACK_LOCALES: Record<string, string> = {
   es: 'es-ES',
   fr: 'fr-FR',
@@ -28,7 +31,7 @@ export const I18nUtils = {
   async initI18n() {
     const locale = I18nUtils.getCurrentLocale();
     await I18nUtils.loadMessages(locale);
-    return { locale, messages: loadedMessages[locale] };
+    return I18nUtils.createIntlWithLocale();
   },
 
   getIntlProviderParams() {
@@ -45,7 +48,9 @@ export const I18nUtils = {
    */
   createIntlWithLocale() {
     const params = I18nUtils.getIntlProviderParams();
-    return createIntl({ locale: params.locale, messages: params.messages }, cache);
+    const intl = createIntl({ locale: params.locale, messages: params.messages }, cache);
+
+    return intl;
   },
 
   getCurrentLocale() {
@@ -53,8 +58,10 @@ export const I18nUtils = {
     const getLocale = () => {
       const langFromQuery = queryParams.get('l');
       if (langFromQuery) {
+        // eslint-disable-next-line @databricks/no-direct-storage -- go/no-direct-storage
         window.localStorage.setItem('locale', langFromQuery);
       }
+      // eslint-disable-next-line @databricks/no-direct-storage -- go/no-direct-storage
       return window.localStorage.getItem('locale') || DEFAULT_LOCALE;
     };
     const locale = getLocale();
@@ -85,11 +92,6 @@ export const I18nUtils = {
   },
 };
 
-export type UseI18nInitResult = {
-  locale: string;
-  messages: Record<string, any>;
-};
-
 /**
  * Ensure initialization of i18n subsystem and return
  * an object with current locale and messages storage.
@@ -99,17 +101,17 @@ export type UseI18nInitResult = {
  * This hook is intended to be used once in the top-level components.
  */
 export const useI18nInit = () => {
-  const [intlState, setIntlState] = useState<UseI18nInitResult | null>(null);
+  const [intl, setIntl] = useState<IntlShape | null>(null);
   useEffect(() => {
     I18nUtils.initI18n()
       .then((initializedIntlState) => {
-        setIntlState(initializedIntlState);
+        setIntl(initializedIntlState);
       })
       .catch((error) => {
         // Fall back to the defaults if loading translation fails
-        setIntlState(I18nUtils.getIntlProviderParams());
+        setIntl(I18nUtils.createIntlWithLocale());
       });
   }, []);
 
-  return intlState;
+  return intl;
 };

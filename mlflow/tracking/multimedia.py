@@ -3,7 +3,8 @@ Internal module implementing multi-media objects and utilities in MLflow. Multi-
 exposed to users at the top-level :py:mod:`mlflow` module.
 """
 
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+import warnings
+from typing import TYPE_CHECKING, Any, Union
 
 if TYPE_CHECKING:
     import numpy
@@ -14,7 +15,7 @@ COMPRESSED_IMAGE_SIZE = 256
 
 
 def compress_image_size(
-    image: "PIL.Image.Image", max_size: Optional[int] = COMPRESSED_IMAGE_SIZE
+    image: "PIL.Image.Image", max_size: int | None = COMPRESSED_IMAGE_SIZE
 ) -> "PIL.Image.Image":
     """
     Scale the image to fit within a square with length `max_size` while maintaining
@@ -31,7 +32,7 @@ def compress_image_size(
     return image.resize((new_width, new_height))
 
 
-def convert_to_pil_image(image: Union["numpy.ndarray", list]) -> "PIL.Image.Image":
+def convert_to_pil_image(image: Union["numpy.ndarray", list[Any]]) -> "PIL.Image.Image":
     """
     Convert a numpy array to a PIL image.
     """
@@ -57,11 +58,14 @@ def convert_to_pil_image(image: Union["numpy.ndarray", list]) -> "PIL.Image.Imag
                     "Ensure all pixel values are within the specified range."
                 )
             else:
-                raise ValueError(
+                warnings.warn(
                     "Float pixel values out of acceptable range [0.0, 1.0]. "
                     f"Found minimum value {x.min()} and maximum value {x.max()}. "
-                    "Ensure all pixel values are within the specified range."
+                    "Rescaling values to [0.0, 1.0] with min/max scaler.",
+                    stacklevel=2,
                 )
+                # Min-max scaling
+                x = (x - x.min()) / (x.max() - x.min())
 
         # float or bool
         if not is_int:
@@ -125,7 +129,7 @@ class Image:
         pixel_values = image_obj.to_list()
     """
 
-    def __init__(self, image: Union["numpy.ndarray", "PIL.Image.Image", str, list]):
+    def __init__(self, image: Union["numpy.ndarray", "PIL.Image.Image", str, list[Any]]):
         import numpy as np
 
         try:
@@ -188,7 +192,7 @@ class Image:
         """
         self.image.save(path)
 
-    def resize(self, size: Tuple[int, int]):
+    def resize(self, size: tuple[int, int]):
         """
         Resize the image to the specified size.
 

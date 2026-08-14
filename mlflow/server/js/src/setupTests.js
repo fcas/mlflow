@@ -2,10 +2,19 @@
 import { configure } from 'enzyme';
 import Adapter from '@wojtekmaj/enzyme-adapter-react-17';
 
+const setupMockFetch = () => {
+  // eslint-disable-next-line import/no-extraneous-dependencies, no-unreachable
+  require('whatwg-fetch');
+};
+
+setupMockFetch();
+
 configure({ adapter: new Adapter() });
 // Included to mock local storage in JS tests, see docs at
 // https://www.npmjs.com/package/jest-localstorage-mock#in-create-react-app
 require('jest-localstorage-mock');
+// Included to mock performance API in tests
+require('../__mocks__/performance');
 
 global.setImmediate = (cb) => {
   return setTimeout(cb, 0);
@@ -41,9 +50,26 @@ jest.mock('./i18n/loadMessages', () => ({
   },
 }));
 
+(() => {
+  // Mock TelemetryClient which uses import.meta.url (not supported in Jest)
+  // eslint-disable-next-line no-unreachable
+  jest.mock('./telemetry/TelemetryClient', () => ({
+    telemetryClient: {
+      logEvent: jest.fn(),
+      shutdown: jest.fn(),
+      start: jest.fn(),
+    },
+  }));
+
+  // Mock crypto API for tests
+  global.crypto = {
+    randomUUID: () => 'test-uuid-' + Math.random().toString(36).substring(2, 15),
+  };
+})();
+
 Object.defineProperty(window, 'matchMedia', {
   writable: true,
-  value: jest.fn().mockImplementation((query) => ({
+  value: jest.fn((query) => ({
     matches: false,
     media: query,
     onchange: null,

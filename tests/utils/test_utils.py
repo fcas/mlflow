@@ -1,30 +1,18 @@
+import importlib.metadata
+import socket
 from unittest import mock
 
 import pytest
+from packaging.version import Version
 
 from mlflow.utils import (
     AttrDict,
     _chunk_dict,
     _get_fully_qualified_class_name,
     _truncate_dict,
-    get_unique_resource_id,
+    get_installed_version,
     merge_dicts,
 )
-
-
-def test_get_unique_resource_id_respects_max_length():
-    for max_length in range(5, 30, 5):
-        for _ in range(10000):
-            assert len(get_unique_resource_id(max_length=max_length)) <= max_length
-
-
-def test_get_unique_resource_id_with_invalid_max_length_throws_exception():
-    match = "unique resource id must be positive"
-    with pytest.raises(ValueError, match=match):
-        get_unique_resource_id(max_length=-50)
-
-    with pytest.raises(ValueError, match=match):
-        get_unique_resource_id(max_length=0)
 
 
 def test_truncate_dict():
@@ -182,3 +170,85 @@ def test_subclass_hasattr():
 
     with pytest.raises(AttributeError, match="'SubAttrDict' object has no attribute 'g'"):
         _ = d.g
+
+
+def test_setattr():
+    d = AttrDict({"a": 1, "b": 2})
+
+    # Set existing attribute
+    d.a = 10
+    assert d.a == 10
+    assert d["a"] == 10
+
+    # Set new attribute
+    d.c = 3
+    assert d.c == 3
+    assert d["c"] == 3
+    assert "c" in d
+
+
+def test_delattr():
+    d = AttrDict({"a": 1, "b": 2, "c": 3})
+
+    # Delete existing attribute
+    del d.b
+    assert "b" not in d
+    assert not hasattr(d, "b")
+
+    # Verify other attributes still exist
+    assert d.a == 1
+    assert d.c == 3
+
+
+def test_delattr_non_existent():
+    d = AttrDict({"a": 1, "b": 2, "c": 3})
+    with pytest.raises(KeyError, match="nonexistent"):
+        del d.nonexistent
+
+
+def test_find_free_port():
+    from mlflow.utils import find_free_port
+
+    port = find_free_port()
+    assert isinstance(port, int)
+    assert 1024 <= port <= 65535
+
+
+def test_is_port_available_returns_true_for_free_port():
+    from mlflow.utils import find_free_port, is_port_available
+
+    port = find_free_port()
+    assert is_port_available(port) is True
+
+
+def test_is_port_available_returns_false_for_bound_port():
+    from mlflow.utils import is_port_available
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        bound_port = s.getsockname()[1]
+        assert is_port_available(bound_port) is False
+
+
+def test_get_installed_version_installed():
+    assert get_installed_version("mlflow") == Version(importlib.metadata.version("mlflow"))
+
+
+def test_get_installed_version_not_installed():
+    assert get_installed_version("this-package-does-not-exist-xyz") is None
+
+
+def test_get_installed_version_package_not_found():
+    with mock.patch(
+        "importlib.metadata.version",
+        side_effect=importlib.metadata.PackageNotFoundError("foo"),
+    ) as mock_version:
+        assert get_installed_version("foo") is None
+        mock_version.assert_called_once_with("foo")
+
+
+@pytest.mark.parametrize("raw", [None, "", "not-a-version", "18.x-aarch64-photon-scala2"])
+def test_get_installed_version_missing_or_invalid(raw):
+    with mock.patch("importlib.metadata.version", return_value=raw) as mock_version:
+        assert get_installed_version("foo") is None
+        mock_version.assert_called_once_with("foo")

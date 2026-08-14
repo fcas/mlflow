@@ -12,7 +12,7 @@ def test_standard_artifact_registry():
     mock_entrypoint = mock.Mock()
     mock_entrypoint.name = "mock-scheme"
 
-    with mock.patch("entrypoints.get_group_all", return_value=[mock_entrypoint]):
+    with mock.patch("mlflow.utils.plugins._get_entry_points", return_value=[mock_entrypoint]):
         # Entrypoints are registered at import time, so we need to reload the
         # module to register the entrypoint given by the mocked
         # entrypoints.get_group_all
@@ -35,8 +35,6 @@ def test_standard_artifact_registry():
 
 
 def test_plugin_registration_via_installed_package():
-    """This test requires the package in tests/resources/mlflow-test-plugin to be installed"""
-
     reload(artifact_repository_registry)
 
     assert "file-plugin" in artifact_repository_registry._artifact_repository_registry._registry
@@ -62,7 +60,9 @@ def test_plugin_registration():
     )
     assert repository_instance == mock_plugin.return_value
 
-    mock_plugin.assert_called_once_with("mock-scheme://fake-host/fake-path")
+    mock_plugin.assert_called_once_with(
+        "mock-scheme://fake-host/fake-path", tracking_uri=None, registry_uri=None
+    )
 
 
 def test_get_unknown_scheme():
@@ -80,7 +80,7 @@ def test_plugin_registration_via_entrypoints():
     mock_entrypoint.name = "mock-scheme"
 
     with mock.patch(
-        "entrypoints.get_group_all", return_value=[mock_entrypoint]
+        "mlflow.utils.plugins._get_entry_points", return_value=[mock_entrypoint]
     ) as mock_get_group_all:
         artifact_repository_registry = ArtifactRepositoryRegistry()
         artifact_repository_registry.register_entrypoints()
@@ -90,7 +90,9 @@ def test_plugin_registration_via_entrypoints():
         == mock_plugin_function.return_value
     )
 
-    mock_plugin_function.assert_called_once_with("mock-scheme://fake-host/fake-path")
+    mock_plugin_function.assert_called_once_with(
+        "mock-scheme://fake-host/fake-path", tracking_uri=None, registry_uri=None
+    )
     mock_get_group_all.assert_called_once_with("mlflow.artifact_repository")
 
 
@@ -102,7 +104,7 @@ def test_plugin_registration_failure_via_entrypoints(exception):
     mock_entrypoint.name = "mock-scheme"
 
     with mock.patch(
-        "entrypoints.get_group_all", return_value=[mock_entrypoint]
+        "mlflow.utils.plugins._get_entry_points", return_value=[mock_entrypoint]
     ) as mock_get_group_all:
         repo_registry = ArtifactRepositoryRegistry()
 

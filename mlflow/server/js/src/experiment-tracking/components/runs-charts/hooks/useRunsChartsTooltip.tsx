@@ -1,11 +1,12 @@
-import { Interpolation, Theme } from '@emotion/react';
+import type { Interpolation, Theme } from '@emotion/react';
 import React, { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   RunsCompareMultipleTracesTooltipData,
   RunsMetricsSingleTraceTooltipData,
 } from '../components/RunsMetricsLinePlot';
-import { RunsMetricsBarPlotHoverData } from '../components/RunsMetricsBarPlot';
-import { shouldEnableDeepLearningUIPhase3 } from '../../../../common/utils/FeatureUtils';
+import type { RunsMetricsBarPlotHoverData } from '../components/RunsMetricsBarPlot';
+import { ChartsTraceHighlightSource, useRunsChartTraceHighlight } from './useRunsChartTraceHighlight';
+import { RUNS_CHARTS_UI_Z_INDEX } from '../utils/runsCharts.const';
 
 export interface RunsChartsTooltipBodyProps<TContext = any, TChartData = any, THoverData = any> {
   runUuid: string;
@@ -28,7 +29,9 @@ export enum RunsChartsTooltipMode {
   MultipleTracesWithScanline = 2,
 }
 
-export type RunsChartsTooltipBodyComponent<C = any, T = any> = React.ComponentType<RunsChartsTooltipBodyProps<C, T>>;
+export type RunsChartsTooltipBodyComponent<C = any, T = any> = React.ComponentType<
+  React.PropsWithChildren<RunsChartsTooltipBodyProps<C, T>>
+>;
 
 const RunsChartsTooltipContext = React.createContext<{
   selectedRunUuid: string | null;
@@ -92,7 +95,7 @@ export const RunsChartsTooltipWrapper = <
 }: React.PropsWithChildren<{
   className?: string;
   contextData: TContext;
-  component: React.ComponentType<RunsChartsTooltipBodyProps<TContext, THover>>;
+  component: React.ComponentType<React.PropsWithChildren<RunsChartsTooltipBodyProps<TContext, THover>>>;
   hoverOnly?: boolean;
 }>) => {
   // A reference to the viewport-wide element containing the context menu
@@ -103,8 +106,6 @@ export const RunsChartsTooltipWrapper = <
 
   // Mutable value containing current mouse position
   const currentPos = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-
-  const usingImprovedClickMechanism = shouldEnableDeepLearningUIPhase3();
 
   // Mutable value containing current snapped mouse position, provided externally by the tooltip data providers
   // Used instead of `currentPos` when the tooltip is in the "multiple runs" mode
@@ -129,6 +130,9 @@ export const RunsChartsTooltipWrapper = <
   const mutableHoveredRunUuid = useRef(hoveredRunUuid);
   const mutableTooltipDisplayParams = useRef(tooltipDisplayParams);
   const mutableAdditionalAxisData = useRef(additionalAxisData);
+
+  // Get the higlighting function from the context
+  const { highlightDataTrace } = useRunsChartTraceHighlight();
 
   // This method applies the tooltip position basing on the mouse position
   const applyPositioning = useCallback(
@@ -302,13 +306,6 @@ export const RunsChartsTooltipWrapper = <
       }
 
       const clickedInTheSamePlace = () => {
-        if (!usingImprovedClickMechanism) {
-          return (
-            focusedRunData.current?.runUuid &&
-            event.pageX === focusedRunData.current.x &&
-            event.pageY === focusedRunData.current.y
-          );
-        }
         const epsilonPixels = 5;
 
         return (
@@ -342,7 +339,7 @@ export const RunsChartsTooltipWrapper = <
       // Since the mouse button is up, reset the currently focused run
       focusedRunData.current = null;
     },
-    [applyPositioning, hoverOnly, getCoordinatesForTargetElement, usingImprovedClickMechanism],
+    [applyPositioning, hoverOnly, getCoordinatesForTargetElement],
   );
 
   // Exposed function used to hide the context menu
@@ -415,6 +412,17 @@ export const RunsChartsTooltipWrapper = <
     }
     return hoveredRunUuid;
   }, [contextMenuShown, hoveredRunUuid]);
+
+  // When the selected data trace changes, report the highlight event
+  useEffect(
+    () =>
+      highlightDataTrace(selectedRunUuid, {
+        source: ChartsTraceHighlightSource.CHART,
+        // Block the highlight event so it won't change as long as the tooltip is in selected mode
+        shouldBlock: Boolean(selectedRunUuid),
+      }),
+    [highlightDataTrace, selectedRunUuid],
+  );
 
   const contextValue = useMemo(
     () => ({ updateTooltip, resetTooltip, destroyTooltip, selectedRunUuid, closeContextMenu }),
@@ -493,15 +501,24 @@ export const useRunsChartsTooltip = <
   }
 
   const { updateTooltip, resetTooltip, selectedRunUuid, closeContextMenu, destroyTooltip } = contextValue;
+  const { highlightDataTrace } = useRunsChartTraceHighlight();
 
   const setTooltip = useCallback(
     (runUuid = '', event?: RunsChartsChartMouseEvent, additionalAxisData?: TAxisData) => {
       updateTooltip(runUuid, mode, chartData, event, additionalAxisData);
+      highlightDataTrace(runUuid, {
+        source: ChartsTraceHighlightSource.CHART,
+      });
     },
-    [updateTooltip, chartData, mode],
+    [updateTooltip, chartData, mode, highlightDataTrace],
   );
 
-  return { setTooltip, resetTooltip, selectedRunUuid, closeContextMenu, destroyTooltip };
+  const resetTooltipWithHighlight = useCallback(() => {
+    resetTooltip();
+    highlightDataTrace(null);
+  }, [resetTooltip, highlightDataTrace]);
+
+  return { setTooltip, resetTooltip: resetTooltipWithHighlight, selectedRunUuid, closeContextMenu, destroyTooltip };
 };
 
 const styles = {
@@ -513,9 +530,10 @@ const styles = {
     height: '100%',
     position: 'fixed',
     pointerEvents: 'none',
+    zIndex: RUNS_CHARTS_UI_Z_INDEX.TOOLTIP_CONTAINER,
   } as Interpolation<Theme>,
   contextMenuWrapper: (theme: Theme) => ({
-    zIndex: 1,
+    zIndex: RUNS_CHARTS_UI_Z_INDEX.TOOLTIP,
     position: 'absolute' as const,
     padding: theme.spacing.sm,
     backgroundColor: theme.colors.backgroundPrimary,

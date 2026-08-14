@@ -1,7 +1,8 @@
+import { jest, describe, test, expect } from '@jest/globals';
 import userEvent from '@testing-library/user-event';
 
 import { ModelVersionViewAliasEditor } from './ModelVersionViewAliasEditor';
-import { renderWithIntl, act, screen, within, findAntdOption } from 'common/utils/TestUtils.react17';
+import { renderWithIntl, act, screen, within, findAntdOption } from '@mlflow/mlflow/src/common/utils/TestUtils.react18';
 import { Provider } from 'react-redux';
 
 import configureStore from 'redux-mock-store';
@@ -12,6 +13,7 @@ import { useEffect, useState } from 'react';
 import type { ModelEntity, ModelVersionInfoEntity } from '../../../experiment-tracking/types';
 import { Services as ModelRegistryServices } from '../../services';
 
+// eslint-disable-next-line no-restricted-syntax -- TODO(FEINF-4392)
 jest.setTimeout(60000); // increase timeout since it's integration testing
 
 /**
@@ -26,6 +28,7 @@ class MockDatabase {
     const initialModel: ModelEntity = {
       name: 'test_model',
       creation_timestamp: 1234,
+      last_updated_timestamp: 2345,
       current_stage: '',
       email_subscription_status: 'active',
       permission_level: '',
@@ -143,8 +146,8 @@ class MockDatabase {
 describe('useEditRegisteredModelAliasesModal integration', () => {
   // Wire up service to the mocked "database" server
   const database = new MockDatabase();
-  ModelRegistryServices.setModelVersionAlias = jest.fn(database.setAlias);
-  ModelRegistryServices.deleteModelVersionAlias = jest.fn(database.deleteAlias);
+  jest.spyOn(ModelRegistryServices, 'setModelVersionAlias').mockImplementation(database.setAlias);
+  jest.spyOn(ModelRegistryServices, 'deleteModelVersionAlias').mockImplementation(database.deleteAlias);
 
   let unmountPage: () => void;
 
@@ -199,13 +202,11 @@ describe('useEditRegisteredModelAliasesModal integration', () => {
     expect(screen.getByRole('status', { name: 'challenger' })).toBeInTheDocument();
 
     // Open the editor modal
-    userEvent.click(screen.getByRole('button', { name: 'Edit aliases' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit aliases' }));
 
     // Type in "champion" alias name, confirm the selection
-    userEvent.type(screen.getByRole('combobox'), 'champion');
-    await act(async () => {
-      userEvent.click(await findAntdOption('champion'));
-    });
+    await userEvent.type(screen.getByRole('combobox'), 'champion');
+    await userEvent.click(await findAntdOption('champion'));
 
     // Assert there's a conflict
     expect(
@@ -215,15 +216,11 @@ describe('useEditRegisteredModelAliasesModal integration', () => {
     ).toBeInTheDocument();
 
     // Add yet another alias, confirm the selection
-    userEvent.type(screen.getByRole('combobox'), 'latest_version');
-    await act(async () => {
-      userEvent.click(await findAntdOption('latest_version'));
-    });
+    await userEvent.type(screen.getByRole('combobox'), 'latest_version');
+    await userEvent.click(await findAntdOption('latest_version'));
 
     // Save the aliases
-    await act(async () => {
-      userEvent.click(screen.getByRole('button', { name: 'Save aliases' }));
-    });
+    await userEvent.click(screen.getByRole('button', { name: 'Save aliases' }));
 
     // Assert there are new aliases loaded from "API"
     expect(screen.getByRole('status', { name: 'champion' })).toBeInTheDocument();
@@ -242,22 +239,20 @@ describe('useEditRegisteredModelAliasesModal integration', () => {
     expect(screen.queryByRole('status', { name: 'latest_version' })).not.toBeInTheDocument();
 
     // Show the editor modal
-    userEvent.click(screen.getByRole('button', { name: 'Edit aliases' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit aliases' }));
 
     // Locate the tag pill with the existing "first_version" alias, click the "X" button within
-    userEvent.click(
+    await userEvent.click(
       within(within(screen.getByRole('dialog')).getByRole('status', { name: 'first_version' })).getByRole('button'),
     );
 
     // Save the new aliases
-    await act(async () => {
-      userEvent.click(screen.getByRole('button', { name: 'Save aliases' }));
-    });
+    await userEvent.click(screen.getByRole('button', { name: 'Save aliases' }));
 
     // Confirm there are no aliases shown at all
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
 
     // Confirm a button with "Add aliases" title is displayed now
-    expect(screen.queryByRole('button', { name: 'Add aliases' })).toBeInTheDocument();
+    expect(screen.queryByTitle('Add aliases')).toBeInTheDocument();
   });
 });

@@ -5,10 +5,13 @@
  * annotations are already looking good, please remove this comment.
  */
 
+import { test, expect, jest, describe, beforeEach, afterEach } from '@jest/globals';
 import Utils from './Utils';
 import React from 'react';
 import { X_AXIS_RELATIVE, X_AXIS_STEP, X_AXIS_WALL } from '../../experiment-tracking/components/MetricsPlotControls';
 import { RunTag } from '../../experiment-tracking/sdk/MlflowMessages';
+import { PermissionError, UnauthorizedError } from '@databricks/web-shared/errors';
+import { ErrorWrapper } from './ErrorWrapper';
 
 test('formatMetric', () => {
   expect(Utils.formatMetric(0)).toEqual('0');
@@ -131,18 +134,7 @@ test('renderNotebookSource', () => {
       {Utils.getDefaultNotebookRevisionName(notebookId, revisionId)}
     </a>,
   );
-  expect(
-    Utils.renderNotebookSource(
-      null,
-      notebookId,
-      revisionId,
-      runUuid,
-      sourceName,
-      null,
-      // @ts-expect-error TS(2345): Argument of type '"some feature"' is not assignabl... Remove this comment to see the full error message
-      nameOverride,
-    ),
-  ).toEqual(
+  expect(Utils.renderNotebookSource(null, notebookId, revisionId, runUuid, sourceName, null, nameOverride)).toEqual(
     <a
       title={sourceName}
       href={`http://localhost/#notebook/${notebookId}/revision/${revisionId}/mlflow/run/${runUuid}`}
@@ -161,16 +153,7 @@ test('renderNotebookSource', () => {
     </a>,
   );
   expect(
-    Utils.renderNotebookSource(
-      queryParams,
-      notebookId,
-      revisionId,
-      runUuid,
-      sourceName,
-      // @ts-expect-error TS(2345): Argument of type '"http://databricks"' is not assi... Remove this comment to see the full error message
-      'http://databricks',
-      null,
-    ),
+    Utils.renderNotebookSource(queryParams, notebookId, revisionId, runUuid, sourceName, 'http://databricks', null),
   ).toEqual(
     <a
       title={sourceName}
@@ -214,7 +197,6 @@ test('renderJobSource', () => {
       {Utils.getDefaultJobRunName(jobId, jobRunId)}
     </a>,
   );
-  // @ts-expect-error TS(2345): Argument of type '"random text"' is not assignable... Remove this comment to see the full error message
   expect(Utils.renderJobSource(null, jobId, jobRunId, jobName, null, nameOverride)).toEqual(
     <a title={jobName} href={`http://localhost/#job/${jobId}/run/${jobRunId}`} target="_top">
       {nameOverride}
@@ -225,10 +207,7 @@ test('renderJobSource', () => {
       {jobName}
     </a>,
   );
-  expect(
-    // @ts-expect-error TS(2345): Argument of type '"https://databricks"' is not ass... Remove this comment to see the full error message
-    Utils.renderJobSource(queryParams, jobId, jobRunId, jobName, 'https://databricks', null),
-  ).toEqual(
+  expect(Utils.renderJobSource(queryParams, jobId, jobRunId, jobName, 'https://databricks', null)).toEqual(
     <a title={jobName} href={`https://databricks/${queryParams}#job/${jobId}/run/${jobRunId}`} target="_top">
       {jobName}
     </a>,
@@ -490,6 +469,8 @@ test('getMetricPlotStateFromUrl', () => {
   const url1 =
     '?runs=["runUuid1","runUuid2"]&plot_metric_keys=["metric_1"]&plot_layout={}&x_axis=wall&y_axis_scale=log&show_point=false';
   const url2 = '?runs=["runUuid1","runUuid2"]&plot_metric_keys=["metric_1","metric_2"]';
+  const url3 =
+    '?runs=["runUuid1","runUuid2"]&plot_metric_keys=%5B%22some%20%23%40!%20unusual%20metric%20name%22%2C%22metric_key_2%22%5D';
   // Test extracting plot keys, point info, y axis log scale, line smoothness, layout info
   expect(Utils.getMetricPlotStateFromUrl(url0)).toEqual({
     selectedXAxis: X_AXIS_STEP,
@@ -516,6 +497,16 @@ test('getMetricPlotStateFromUrl', () => {
   expect(Utils.getMetricPlotStateFromUrl(url2)).toEqual({
     selectedXAxis: X_AXIS_RELATIVE,
     selectedMetricKeys: ['metric_1', 'metric_2'],
+    showPoint: false,
+    yAxisLogScale: false,
+    lineSmoothness: 0,
+    layout: { autosize: true },
+    deselectedCurves: [],
+    lastLinearYAxisRange: [],
+  });
+  expect(Utils.getMetricPlotStateFromUrl(url3)).toEqual({
+    selectedXAxis: X_AXIS_RELATIVE,
+    selectedMetricKeys: ['some #@! unusual metric name', 'metric_key_2'],
     showPoint: false,
     yAxisLogScale: false,
     lineSmoothness: 0,
@@ -584,10 +575,10 @@ test('getSearchUrlFromState', () => {
 });
 
 test('compareExperiments', () => {
-  const exp0 = { experiment_id: '0' };
-  const exp1 = { experiment_id: '1' };
-  const expA = { experiment_id: 'A' };
-  const expB = { experiment_id: 'B' };
+  const exp0 = { experimentId: '0' };
+  const exp1 = { experimentId: '1' };
+  const expA = { experimentId: 'A' };
+  const expB = { experimentId: 'B' };
 
   expect(Utils.compareExperiments(exp0, exp1)).toEqual(-1);
   expect(Utils.compareExperiments(exp1, exp0)).toEqual(1);
@@ -669,6 +660,40 @@ test('getLoggedModelsFromTags should correctly dedup and sort logged models', ()
       utcTimeCreated: 1604016000,
     },
   ]);
+});
+
+test('getLoggedModelsFromTags should not crash on invalid JSON', () => {
+  const tagValue = JSON.stringify([
+    {
+      run_id: 'run-uuid',
+      artifact_path: 'somePath',
+      utc_time_created: '2020-10-29',
+      flavors: { keras: {}, python_function: {} },
+    },
+    {
+      run_id: 'run-uuid',
+      artifact_path: 'somePath',
+      utc_time_created: '2020-10-30',
+      flavors: { sklearn: {}, python_function: {} },
+    },
+    {
+      run_id: 'run-uuid',
+      artifact_path: 'someOtherPath',
+      utc_time_created: '2020-10-31',
+      flavors: { python_function: {} },
+    },
+  ]);
+
+  const tags = {
+    'mlflow.log-model.history': {
+      key: 'mlflow.log-model.history',
+      value: tagValue.slice(10), // truncate the JSON string to make it invalid
+    },
+  };
+
+  // it should just return an empty array
+  const models = Utils.getLoggedModelsFromTags(tags);
+  expect(models.length).toEqual(0);
 });
 
 test('mergeLoggedAndRegisteredModels should merge logged and registered model', () => {
@@ -817,7 +842,6 @@ test('mergeLoggedAndRegisteredModels should output registered models in order', 
   modelVersions[1].version = '2';
   modelVersions[1].creation_timestamp = 1000;
   models = Utils.mergeLoggedAndRegisteredModels(loggedModels, modelVersions);
-  // @ts-expect-error TODO: fix this
   expect(models[0].registeredModelVersion).toEqual('3');
   // Only one registered
   modelVersions = [modelVersions[0]];
@@ -922,4 +946,90 @@ test('isValidHttpUrl', () => {
   // disable no-script-url rule to test that javascript protocol is not seen as valid url
   /* eslint-disable no-script-url*/
   expect(Utils.isValidHttpUrl('javascript:void(0)')).toEqual(false);
+});
+
+test('getJobSourceUrl rejects dangerous workspaceUrl', () => {
+  expect(Utils.getJobSourceUrl(null, '123', '456', 'https://databricks.com')).toEqual(
+    'https://databricks.com/#job/123/run/456',
+  );
+
+  /* eslint-disable no-script-url */
+  expect(Utils.getJobSourceUrl(null, '123', '456', 'javascript://evil.com')).toEqual('');
+  /* eslint-enable no-script-url */
+});
+
+test('getNotebookSourceUrl rejects dangerous workspaceUrl', () => {
+  expect(Utils.getNotebookSourceUrl(null, '789', 'rev1', 'run1', 'https://databricks.com')).toEqual(
+    'https://databricks.com/#notebook/789/revision/rev1/mlflow/run/run1',
+  );
+
+  /* eslint-disable no-script-url */
+  expect(Utils.getNotebookSourceUrl(null, '789', 'rev1', null, 'javascript://evil.com')).toEqual('');
+  /* eslint-enable no-script-url */
+});
+
+test('renderJobSource renders plain text for dangerous workspaceUrl', () => {
+  expect(Utils.renderJobSource(null, '123', '456', 'my job', null)).toEqual(
+    <a title="my job" href="http://localhost/#job/123/run/456" target="_top">
+      my job
+    </a>,
+  );
+
+  /* eslint-disable no-script-url */
+  expect(Utils.renderJobSource(null, '123', '456', 'my job', 'javascript://evil.com', null)).toEqual('my job');
+  /* eslint-enable no-script-url */
+});
+
+test('renderNotebookSource renders plain text for dangerous workspaceUrl', () => {
+  expect(Utils.renderNotebookSource(null, '789', 'rev1', null, '/Users/test/iris', null)).toEqual(
+    <a title="/Users/test/iris" href="http://localhost/#notebook/789/revision/rev1" target="_top">
+      iris
+    </a>,
+  );
+
+  /* eslint-disable no-script-url */
+  expect(
+    Utils.renderNotebookSource(null, '789', 'rev1', null, '/Users/test/iris', 'javascript://evil.com', null),
+  ).toEqual('iris');
+  /* eslint-enable no-script-url */
+});
+
+describe('logErrorAndNotifyUser', () => {
+  let mockNotificationsApi: { error: ReturnType<typeof jest.fn> };
+
+  beforeEach(() => {
+    mockNotificationsApi = { error: jest.fn() };
+    Utils.registerNotificationsApi(mockNotificationsApi);
+  });
+
+  afterEach(() => {
+    Utils.registerNotificationsApi(null);
+  });
+
+  test('shows toast for plain string errors', () => {
+    Utils.logErrorAndNotifyUser('something went wrong');
+    expect(mockNotificationsApi.error).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'something went wrong' }),
+    );
+  });
+
+  test('shows toast for ErrorWrapper errors', () => {
+    const wrapper = new ErrorWrapper('{"error_code":"PERMISSION_DENIED","message":"not allowed"}', 403);
+    Utils.logErrorAndNotifyUser(wrapper);
+    expect(mockNotificationsApi.error).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'PERMISSION_DENIED: not allowed' }),
+    );
+  });
+
+  test('shows toast for PermissionError (PredefinedError) instead of silently dropping it', () => {
+    const error = new PermissionError({});
+    Utils.logErrorAndNotifyUser(error);
+    expect(mockNotificationsApi.error).toHaveBeenCalledWith(expect.objectContaining({ message: error.displayMessage }));
+  });
+
+  test('shows toast for UnauthorizedError (PredefinedError)', () => {
+    const error = new UnauthorizedError({});
+    Utils.logErrorAndNotifyUser(error);
+    expect(mockNotificationsApi.error).toHaveBeenCalledWith(expect.objectContaining({ message: error.displayMessage }));
+  });
 });

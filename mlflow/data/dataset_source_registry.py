@@ -1,13 +1,11 @@
 import warnings
-from typing import Any, List, Optional
+from typing import Any
 
-import entrypoints
-
-from mlflow.data.artifact_dataset_sources import register_artifact_dataset_sources
 from mlflow.data.dataset_source import DatasetSource
 from mlflow.data.http_dataset_source import HTTPDatasetSource
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
+from mlflow.utils.plugins import get_entry_points
 
 
 class DatasetSourceRegistry:
@@ -27,18 +25,18 @@ class DatasetSourceRegistry:
         Registers dataset sources defined as Python entrypoints. For reference, see
         https://mlflow.org/docs/latest/plugins.html#defining-a-plugin.
         """
-        for entrypoint in entrypoints.get_group_all("mlflow.dataset_source"):
+        for entrypoint in get_entry_points("mlflow.dataset_source"):
             try:
                 self.register(entrypoint.load())
             except (AttributeError, ImportError) as exc:
                 warnings.warn(
-                    f"Failure attempting to register dataset source with source type"
-                    f' "{entrypoint.source_type}": {exc}',
+                    "Failure attempting to register dataset constructor"
+                    + f' "{entrypoint}": {exc}',
                     stacklevel=2,
                 )
 
     def resolve(
-        self, raw_source: Any, candidate_sources: Optional[List[DatasetSource]] = None
+        self, raw_source: Any, candidate_sources: list[DatasetSource] | None = None
     ) -> DatasetSource:
         """Resolves a raw source object, such as a string URI, to a DatasetSource for use with
         MLflow Tracking.
@@ -128,7 +126,7 @@ def register_dataset_source(source: DatasetSource):
 
 
 def resolve_dataset_source(
-    raw_source: Any, candidate_sources: Optional[List[DatasetSource]] = None
+    raw_source: Any, candidate_sources: list[DatasetSource] | None = None
 ) -> DatasetSource:
     """Resolves a raw source object, such as a string URI, to a DatasetSource for use with
     MLflow Tracking.
@@ -165,7 +163,7 @@ def get_dataset_source_from_json(source_json: str, source_type: str) -> DatasetS
     )
 
 
-def get_registered_sources() -> List[DatasetSource]:
+def get_registered_sources() -> list[DatasetSource]:
     """Obtains the registered dataset sources.
 
     Returns:
@@ -184,7 +182,12 @@ def get_registered_sources() -> List[DatasetSource]:
 # dataset sources are registered last because externally-defined behavior should take precedence
 # over any internally-defined generic behavior
 _dataset_source_registry = DatasetSourceRegistry()
+
+# Register artifact sources first (they should take lower precedence)
+from mlflow.data.artifact_dataset_sources import register_artifact_dataset_sources
+
 register_artifact_dataset_sources()
+
 _dataset_source_registry.register(HTTPDatasetSource)
 _dataset_source_registry.register_entrypoints()
 
@@ -216,5 +219,15 @@ try:
     from mlflow.data.uc_volume_dataset_source import UCVolumeDatasetSource
 
     _dataset_source_registry.register(UCVolumeDatasetSource)
+except ImportError:
+    pass
+try:
+    from mlflow.genai.datasets.databricks_evaluation_dataset_source import (
+        DatabricksEvaluationDatasetSource,
+        DatabricksUCTableDatasetSource,
+    )
+
+    _dataset_source_registry.register(DatabricksEvaluationDatasetSource)
+    _dataset_source_registry.register(DatabricksUCTableDatasetSource)
 except ImportError:
     pass

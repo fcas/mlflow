@@ -10,7 +10,7 @@ import {
   useDesignSystemTheme,
 } from '@databricks/design-system';
 import { ModelRegistryRoutes } from '../../routes';
-import { KeyValueEntity } from '../../../experiment-tracking/types';
+import type { KeyValueEntity } from '../../../common/types';
 import { MLFLOW_INTERNAL_PREFIX } from '../../../common/utils/TagUtils';
 
 const EmptyCell = () => <>&mdash;</>;
@@ -38,21 +38,22 @@ export const ModelListTagsCell = ({ tags }: { tags: KeyValueEntity[] }) => {
     <div>
       {tagsToDisplay.map((tag) => (
         <Tooltip
+          componentId="mlflow.model-registry.model-list.model-tag.tooltip"
           key={tag.key}
-          title={
+          content={
             <>
               {tag.key}: {tag.value || noValue}
             </>
           }
-          placement="left"
+          side="left"
         >
-          <div
+          <span
             key={tag.key}
             css={{ overflow: 'hidden', textOverflow: 'ellipsis' }}
             data-testid="models-table-tag-entry"
           >
             <Typography.Text bold>{tag.key}</Typography.Text>: {tag.value || noValue}
-          </div>
+          </span>
         </Tooltip>
       ))}
       {tags.length > tagsToShowInitially && (
@@ -95,7 +96,14 @@ export const ModelListVersionLinkCell = ({ versionNumber, name }: { versionNumbe
       description="Row entry for version columns in the registered model page"
       values={{
         versionNumber,
-        link: (text: any) => <Link to={ModelRegistryRoutes.getModelVersionPageRoute(name, versionNumber)}>{text}</Link>,
+        link: (text: any) => (
+          <Link
+            componentId="mlflow.model_registry.model_list.version_link"
+            to={ModelRegistryRoutes.getModelVersionPageRoute(name, versionNumber)}
+          >
+            {text}
+          </Link>
+        ),
       }}
     />
   );

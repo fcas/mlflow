@@ -23,7 +23,7 @@ def test_entry_point_compute_params():
             {"name": "friend", "excitement": 10}, storage_dir
         )
         assert params == {"name": "friend", "greeting": "hi"}
-        assert extra_params == {"excitement": "10"}
+        assert extra_params == {quote("excitement"): quote("10")}
         # Don't pass extra "excitement" param, pass value for `greeting`
         params, extra_params = entry_point.compute_parameters(
             {"name": "friend", "greeting": "hello"}, storage_dir
@@ -55,6 +55,19 @@ def test_entry_point_compute_command():
         name_value = "friend; echo 'hi'"
         command = entry_point.compute_command({"name": name_value}, storage_dir)
         assert command == "python greeter.py {} {}".format(quote("hi"), quote(name_value))
+
+
+@pytest.mark.parametrize(
+    "malicious_key",
+    ["x;touch /tmp/pwned", "a&b", "a|b", "a`b`", "a$(b)", "a>b"],
+)
+def test_compute_command_shell_escapes_extra_param_keys(malicious_key):
+    entry_point = load_project().get_entry_point("greeter")
+    with TempDir() as tmp:
+        command = entry_point.compute_command({"name": "friend", malicious_key: "1"}, tmp.path())
+        # Raw command must contain the shell-quoted key so bash parses it as a
+        # single (nonsensical) flag token rather than executing the payload.
+        assert f"--{quote(malicious_key)}" in command
 
 
 def test_path_parameter():
@@ -108,12 +121,14 @@ def test_path_parameter():
 
 
 def test_uri_parameter():
-    """Tests parameter resolution for parameters of type `uri`."""
     project = load_project()
     entry_point = project.get_entry_point("download_uri")
-    with mock.patch(
-        "mlflow.tracking.artifact_utils._download_artifact_from_uri"
-    ) as download_uri_mock, TempDir() as tmp:
+    with (
+        mock.patch(
+            "mlflow.tracking.artifact_utils._download_artifact_from_uri"
+        ) as download_uri_mock,
+        TempDir() as tmp,
+    ):
         dst_dir = tmp.path()
         # Test that we don't attempt to locally download parameters of type URI
         entry_point.compute_command(
@@ -149,7 +164,7 @@ def test_params():
         "l2_ratio": "0.0003",
         "random_str": "hello",
     }
-    expected_extra_3 = {"gamma": "0.89"}
+    expected_extra_3 = {quote("gamma"): quote("0.89")}
     final_3, extra_3 = entry_point.compute_parameters(user_3, None)
     assert expected_extra_3 == extra_3
     assert expected_final_3 == final_3
@@ -161,7 +176,7 @@ def test_params():
         "l2_ratio": "0.0003",
         "random_str": "hello",
     }
-    expected_extra_4 = {"random_str_2": "hello"}
+    expected_extra_4 = {quote("random_str_2"): quote("hello")}
     final_4, extra_4 = entry_point.compute_parameters(user_4, None)
     assert expected_extra_4 == extra_4
     assert expected_final_4 == final_4
@@ -185,7 +200,7 @@ def test_params():
         "l2_ratio": "0.0003",
         "random_str": "hello",
     }
-    expected_extra_6 = {"ALPHA": "0.89"}
+    expected_extra_6 = {quote("ALPHA"): quote("0.89")}
     final_6, extra_6 = entry_point.compute_parameters(user_6, None)
     assert expected_extra_6 == extra_6
     assert expected_final_6 == final_6
@@ -216,9 +231,12 @@ def test_path_params():
         assert extra_2 == {"alpha": "0.001"}
         assert download_uri_mock.call_count == 0
 
-    with mock.patch(
-        "mlflow.tracking.artifact_utils._download_artifact_from_uri"
-    ) as download_uri_mock, TempDir() as tmp:
+    with (
+        mock.patch(
+            "mlflow.tracking.artifact_utils._download_artifact_from_uri"
+        ) as download_uri_mock,
+        TempDir() as tmp,
+    ):
         dest_path = tmp.path()
         download_path = f"{dest_path}/data_file.csv"
         download_uri_mock.return_value = download_path
@@ -228,9 +246,12 @@ def test_path_params():
         assert extra_3 == {"alpha": "0.001"}
         assert download_uri_mock.call_count == 1
 
-    with mock.patch(
-        "mlflow.tracking.artifact_utils._download_artifact_from_uri"
-    ) as download_uri_mock, TempDir() as tmp:
+    with (
+        mock.patch(
+            "mlflow.tracking.artifact_utils._download_artifact_from_uri"
+        ) as download_uri_mock,
+        TempDir() as tmp,
+    ):
         dest_path = tmp.path()
         download_path = f"{dest_path}/images.tgz"
         download_uri_mock.return_value = download_path

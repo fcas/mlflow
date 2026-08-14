@@ -1,57 +1,79 @@
 import { difference } from 'lodash';
 import { getUUID } from '../../common/utils/ActionUtils';
-import { fetchEndpoint, jsonBigIntResponseParser } from '../../common/utils/FetchUtils';
-import { AsyncAction, ReduxState, ThunkDispatch } from '../../redux-types';
+import { defaultResponseParser, fetchEndpoint } from '../../common/utils/FetchUtils';
+import type { AsyncAction, ReduxState, ThunkDispatch } from '../../redux-types';
 import { createChartAxisRangeKey } from '../components/runs-charts/components/RunsCharts.common';
-import { MetricEntity } from '../types';
+import type { MetricEntity } from '../types';
 import { type ParsedQs, stringify as queryStringStringify } from 'qs';
+import { EXPERIMENT_RUNS_SAMPLE_METRIC_AUTO_REFRESH_INTERVAL } from '../utils/MetricsUtils';
 
 interface GetHistoryBulkIntervalResponseType {
   metrics: (MetricEntity & { run_id: string })[];
 }
 
 export const GET_SAMPLED_METRIC_HISTORY_API_BULK = 'GET_SAMPLED_METRIC_HISTORY_API_BULK';
-export interface GetSampledMetricHistoryBulkAction
-  extends AsyncAction<
-    GetHistoryBulkIntervalResponseType,
-    {
-      id?: string;
-      isRefreshing?: boolean;
-      runUuids: string[];
-      key: string;
-      rangeKey: string;
-      maxResults?: number;
-    }
-  > {
+export interface GetSampledMetricHistoryBulkAction extends AsyncAction<
+  GetHistoryBulkIntervalResponseType,
+  {
+    id?: string;
+    isRefreshing?: boolean;
+    runUuids: string[];
+    key: string;
+    rangeKey: string;
+    maxResults?: number;
+  }
+> {
   type: 'GET_SAMPLED_METRIC_HISTORY_API_BULK';
 }
+
 export const getSampledMetricHistoryBulkAction =
   (
     runUuids: string[],
     metricKey: string,
     maxResults?: number,
     range?: [number | string, number | string],
-    isRefreshing = false,
+    /**
+     * Refresh mode.
+     * If set to `all`, disregard cache and always fetch data for all run UUIDs.
+     * If set to  `auto`, fetch data for run UUIDs that the data is considered stale.
+     * If unset, fetch data for run UUIDs that we don't have data for.
+     */
+    refreshMode: 'all' | 'auto' | undefined = undefined,
   ) =>
   (dispatch: ThunkDispatch, getState: () => ReduxState) => {
     const rangeKey = createChartAxisRangeKey(range);
     const getExistingDataForRunUuid = (runUuid: string) =>
       getState().entities.sampledMetricsByRunUuid[runUuid]?.[metricKey];
 
-    // Find run UUIDs that we already have data for
-    const skippedRunUuids = runUuids.filter(
-      (runUuid) =>
-        getExistingDataForRunUuid(runUuid)?.[rangeKey]?.error ||
-        getExistingDataForRunUuid(runUuid)?.[rangeKey]?.loading ||
-        getExistingDataForRunUuid(runUuid)?.[rangeKey]?.metricsHistory,
-    );
+    const skippedRunUuids = runUuids.filter((runUuid) => {
+      // If refresh mode is set to `all`, no runs are skipped
+      if (refreshMode === 'all') {
+        return false;
+      }
+      const sampledHistoryEntry = getExistingDataForRunUuid(runUuid)?.[rangeKey];
 
-    // If we are not refreshing, use only run UUIDs that we don't have data for.
-    // If we are refreshing, fetch data for all run UUIDs.
-    const runUuidsToFetch = isRefreshing ? runUuids : difference(runUuids, skippedRunUuids);
+      // If refresh mode is set to `auto`, skip runs that are fresh or are being loaded
+      if (refreshMode === 'auto') {
+        const timePassedSinceLastUpdate = Date.now() - (sampledHistoryEntry?.lastUpdatedTime || 0);
+        const isFresh = timePassedSinceLastUpdate < EXPERIMENT_RUNS_SAMPLE_METRIC_AUTO_REFRESH_INTERVAL;
+        const isInitialized = Boolean(sampledHistoryEntry?.lastUpdatedTime);
+        const isLoadingOrRefreshing = sampledHistoryEntry?.loading || sampledHistoryEntry?.refreshing;
+
+        // Skip loading data for runs that
+        // - were not initialized before
+        // - have fresh data
+        // - are being loaded already
+        return !isInitialized || isFresh || isLoadingOrRefreshing;
+      }
+
+      // If refresh mode is unset, skip runs that we already have data for
+      return sampledHistoryEntry?.error || sampledHistoryEntry?.loading || sampledHistoryEntry?.metricsHistory;
+    });
+
+    const runUuidsToFetch = difference(runUuids, skippedRunUuids);
 
     if (!runUuidsToFetch.length || !decodeURIComponent(metricKey)) {
-      return;
+      return Promise.resolve();
     }
 
     // Prepare query params
@@ -78,10 +100,10 @@ export const getSampledMetricHistoryBulkAction =
 
     const request = fetchEndpoint({
       relativeUrl: `ajax-api/2.0/mlflow/metrics/get-history-bulk-interval?${queryParams}`,
-      success: jsonBigIntResponseParser,
+      success: defaultResponseParser,
     });
 
-    dispatch({
+    return dispatch({
       type: GET_SAMPLED_METRIC_HISTORY_API_BULK,
       payload: request,
       meta: {
@@ -90,7 +112,7 @@ export const getSampledMetricHistoryBulkAction =
         key: metricKey,
         rangeKey,
         maxResults,
-        isRefreshing,
+        isRefreshing: Boolean(refreshMode),
       },
     });
   };

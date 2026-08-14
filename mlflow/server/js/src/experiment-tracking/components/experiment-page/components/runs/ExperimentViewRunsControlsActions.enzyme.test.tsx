@@ -1,3 +1,4 @@
+import { jest, describe, test, expect } from '@jest/globals';
 import { useState } from 'react';
 import type { ReactWrapper } from 'enzyme';
 import { IntlProvider } from 'react-intl';
@@ -5,25 +6,16 @@ import { Provider } from 'react-redux';
 import { MemoryRouter } from '../../../../../common/utils/RoutingUtils';
 import { applyMiddleware, compose, createStore } from 'redux';
 import promiseMiddleware from 'redux-promise-middleware';
-import { mountWithIntl } from 'common/utils/TestUtils.enzyme';
+import { mountWithIntl } from '@mlflow/mlflow/src/common/utils/TestUtils.enzyme';
 import { EXPERIMENT_RUNS_MOCK_STORE } from '../../fixtures/experiment-runs.fixtures';
-import { SearchExperimentRunsFacetsState } from '../../models/SearchExperimentRunsFacetsState';
-import { SearchExperimentRunsViewState } from '../../models/SearchExperimentRunsViewState';
+// import { SearchExperimentRunsFacetsState } from '../../models/SearchExperimentRunsFacetsState';
+import { ExperimentPageViewState } from '../../models/ExperimentPageViewState';
 import { experimentRunsSelector } from '../../utils/experimentRuns.selector';
-import {
-  ExperimentViewRunsControlsActions,
-  ExperimentViewRunsControlsActionsProps,
-} from './ExperimentViewRunsControlsActions';
-
-jest.mock('../../hooks/useFetchExperimentRuns', () => ({
-  useFetchExperimentRuns: jest.fn(() => ({
-    searchFacetsState: {},
-  })),
-}));
-
-jest.mock('./ExperimentViewRefreshButton', () => ({
-  ExperimentViewRefreshButton: () => <div />,
-}));
+import type { ExperimentViewRunsControlsActionsProps } from './ExperimentViewRunsControlsActions';
+import { ExperimentViewRunsControlsActions } from './ExperimentViewRunsControlsActions';
+import type { ExperimentPageSearchFacetsState } from '../../models/ExperimentPageSearchFacetsState';
+import { createExperimentPageSearchFacetsState } from '../../models/ExperimentPageSearchFacetsState';
+import { DesignSystemProvider } from '@databricks/design-system';
 
 const MOCK_EXPERIMENT = EXPERIMENT_RUNS_MOCK_STORE.entities.experimentsById['123456789'];
 
@@ -31,7 +23,7 @@ const MOCK_RUNS_DATA = experimentRunsSelector(EXPERIMENT_RUNS_MOCK_STORE, {
   experiments: [MOCK_EXPERIMENT],
 });
 
-const DEFAULT_VIEW_STATE = new SearchExperimentRunsViewState();
+const DEFAULT_VIEW_STATE = new ExperimentPageViewState();
 
 const doMock = (additionalProps: Partial<ExperimentViewRunsControlsActionsProps> = {}) => {
   const mockUpdateSearchFacets = jest.fn();
@@ -40,19 +32,11 @@ const doMock = (additionalProps: Partial<ExperimentViewRunsControlsActionsProps>
   const getCurrentState = () => currentState;
 
   const Component = () => {
-    const [searchFacetsState, setSearchFacetsState] = useState<SearchExperimentRunsFacetsState>(
-      new SearchExperimentRunsFacetsState(),
+    const [searchFacetsState, setSearchFacetsState] = useState<ExperimentPageSearchFacetsState>(
+      createExperimentPageSearchFacetsState(),
     );
 
     currentState = searchFacetsState;
-
-    const updateSearchFacets: any = (
-      updatedFacetsState: Partial<SearchExperimentRunsFacetsState>,
-      forceRefresh?: boolean,
-    ) => {
-      mockUpdateSearchFacets(updatedFacetsState, forceRefresh);
-      setSearchFacetsState((s: any) => ({ ...s, ...updatedFacetsState }));
-    };
 
     const props: ExperimentViewRunsControlsActionsProps = {
       runsData: MOCK_RUNS_DATA,
@@ -65,11 +49,13 @@ const doMock = (additionalProps: Partial<ExperimentViewRunsControlsActionsProps>
       <Provider
         store={createStore((s) => s as any, EXPERIMENT_RUNS_MOCK_STORE, compose(applyMiddleware(promiseMiddleware())))}
       >
-        <MemoryRouter>
-          <IntlProvider locale="en">
-            <ExperimentViewRunsControlsActions {...props} />
-          </IntlProvider>
-        </MemoryRouter>
+        <DesignSystemProvider>
+          <MemoryRouter>
+            <IntlProvider locale="en">
+              <ExperimentViewRunsControlsActions {...props} />
+            </IntlProvider>
+          </MemoryRouter>
+        </DesignSystemProvider>
       </Provider>
     );
   };
@@ -102,8 +88,6 @@ describe('ExperimentViewRunsControlsFilters', () => {
         columnSelectorVisible: false,
         previewPaneVisible: false,
         artifactViewState: {},
-        viewMaximized: false,
-        runListHidden: false,
       },
     });
 
@@ -128,8 +112,6 @@ describe('ExperimentViewRunsControlsFilters', () => {
         columnSelectorVisible: false,
         previewPaneVisible: false,
         artifactViewState: {},
-        viewMaximized: false,
-        runListHidden: false,
       },
     });
 
@@ -154,8 +136,6 @@ describe('ExperimentViewRunsControlsFilters', () => {
         columnSelectorVisible: false,
         previewPaneVisible: false,
         artifactViewState: {},
-        viewMaximized: false,
-        runListHidden: false,
       },
     });
 
@@ -171,8 +151,6 @@ describe('ExperimentViewRunsControlsFilters', () => {
         columnSelectorVisible: false,
         previewPaneVisible: false,
         artifactViewState: {},
-        viewMaximized: false,
-        runListHidden: false,
       },
     });
 

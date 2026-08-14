@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { RunInfoEntity } from '../../../types';
+import type { RunInfoEntity } from '../../../types';
 import { chartColors, ChartStoryWrapper, getRandomRunName, stableNormalRandom } from './RunsCharts.stories-common';
-import { RunsMetricsBarPlot, RunsMetricsBarPlotProps } from './RunsMetricsBarPlot';
+import type { RunsMetricsBarPlotProps } from './RunsMetricsBarPlot';
+import { RunsMetricsBarPlot } from './RunsMetricsBarPlot';
 
 export default {
   title: 'Runs charts/Metrics/Bar plot',
@@ -24,8 +25,8 @@ const createMockMetricsData = (numRuns: number, negative = false): RunsMetricsBa
       uuid: `id-for-run-${runName}`,
       displayName: runName,
       runInfo: {
-        run_uuid: `id-for-run-${runName}`,
-        run_name: runName,
+        runUuid: `id-for-run-${runName}`,
+        runName: runName,
       } as RunInfoEntity,
       metrics: { metric1: { value } as any },
       color: chartColors[index % chartColors.length],

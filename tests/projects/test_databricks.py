@@ -25,6 +25,7 @@ from mlflow.utils.mlflow_tags import (
     MLFLOW_DATABRICKS_SHELL_JOB_RUN_ID,
     MLFLOW_DATABRICKS_WEBAPP_URL,
 )
+from mlflow.utils.rest_utils import MlflowHostCreds
 from mlflow.utils.uri import construct_db_uri_from_profile
 
 from tests import helper_functions
@@ -189,11 +190,12 @@ def test_upload_existing_project_to_dbfs(dbfs_path_exists_mock):
     ],
 )
 def test_dbfs_path_exists_error_response_handling(response_mock):
-    with mock.patch(
-        "mlflow.utils.databricks_utils.get_databricks_host_creds"
-    ) as get_databricks_host_creds_mock, mock.patch(
-        "mlflow.utils.rest_utils.http_request"
-    ) as http_request_mock:
+    with (
+        mock.patch(
+            "mlflow.utils.databricks_utils.get_databricks_host_creds"
+        ) as get_databricks_host_creds_mock,
+        mock.patch("mlflow.utils.rest_utils.http_request") as http_request_mock,
+    ):
         # given a well formed DatabricksJobRunner
         # note: databricks_profile is None needed because clients using profile are mocked
         job_runner = DatabricksJobRunner(databricks_profile_uri=None)
@@ -218,12 +220,13 @@ def test_run_databricks_validations(
     """
     Tests that running on Databricks fails before making any API requests if validations fail.
     """
-    monkeypatch.setenvs({"DATABRICKS_HOST": "test-host", "DATABRICKS_TOKEN": "foo"})
+    monkeypatch.setenv("DATABRICKS_HOST", "test-host")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "foo")
     with mock.patch(
         "mlflow.projects.databricks.DatabricksJobRunner._databricks_api_request"
     ) as db_api_req_mock:
         # Test bad tracking URI
-        mlflow.set_tracking_uri(tmp_path.as_uri())
+        mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'mlflow.db'}")
         with pytest.raises(ExecutionException, match="MLflow tracking URI must be of"):
             run_databricks_project(cluster_spec_mock, synchronous=True)
         assert db_api_req_mock.call_count == 0
@@ -269,9 +272,9 @@ def test_run_databricks(
     databricks_cluster_mlflow_run_cmd_mock,
     monkeypatch,
 ):
-    """Test running on Databricks with mocks."""
-    monkeypatch.setenv("DATABRICKS_HOST", "test-host")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://test-host")
     monkeypatch.setenv("DATABRICKS_TOKEN", "foo")
+    mlflow.set_tracking_uri("databricks")
     # Test that MLflow gets the correct run status when performing a Databricks run
     for run_succeeded, expect_status in [(True, RunStatus.FINISHED), (False, RunStatus.FAILED)]:
         runs_get_mock.return_value = mock_runs_get_result(succeeded=run_succeeded)
@@ -285,7 +288,7 @@ def test_run_databricks(
             tags[call_args[1]] = call_args[2]
         assert tags[MLFLOW_DATABRICKS_RUN_URL] == "test_url"
         assert tags[MLFLOW_DATABRICKS_SHELL_JOB_RUN_ID] == "-1"
-        assert tags[MLFLOW_DATABRICKS_WEBAPP_URL] == "test-host"
+        assert tags[MLFLOW_DATABRICKS_WEBAPP_URL] == "https://test-host"
         set_tag_mock.reset_mock()
         runs_submit_mock.reset_mock()
         databricks_cluster_mlflow_run_cmd_mock.reset_mock()
@@ -434,14 +437,7 @@ class MockProfileConfigProvider:
         return DatabricksConfig.from_password("host", "user", "pass", insecure=False)
 
 
-@mock.patch("requests.Session.request")
-@mock.patch("mlflow.utils.databricks_utils.get_config")
-@mock.patch.object(
-    mlflow.utils.databricks_utils, "ProfileConfigProvider", MockProfileConfigProvider
-)
-def test_databricks_http_request_integration(get_config, request):
-    """Confirms that the databricks http request params can in fact be used as an HTTP request"""
-
+def test_databricks_http_request_integration():
     def confirm_request_params(*args, **kwargs):
         headers = DefaultRequestHeaderProvider().request_headers()
         headers["Authorization"] = "Basic dXNlcjpwYXNz"
@@ -458,26 +454,29 @@ def test_databricks_http_request_integration(get_config, request):
         http_response.text = '{"OK": "woo"}'
         return http_response
 
-    request.side_effect = confirm_request_params
-    get_config.return_value = DatabricksConfig.from_password("host", "user", "pass", insecure=False)
+    with (
+        mock.patch("requests.Session.request", side_effect=confirm_request_params),
+        mock.patch(
+            "mlflow.utils.databricks_utils.get_databricks_host_creds",
+            return_value=MlflowHostCreds(
+                host="host", username="user", password="pass", ignore_tls_verification=False
+            ),
+        ),
+    ):
+        response = DatabricksJobRunner(databricks_profile_uri=None)._databricks_api_request(
+            "/clusters/list", "PUT", json={"a": "b"}
+        )
+        assert json.loads(response.text) == {"OK": "woo"}
 
-    response = DatabricksJobRunner(databricks_profile_uri=None)._databricks_api_request(
-        "/clusters/list", "PUT", json={"a": "b"}
-    )
-    assert json.loads(response.text) == {"OK": "woo"}
-    get_config.reset_mock()
-    response = DatabricksJobRunner(
-        databricks_profile_uri=construct_db_uri_from_profile("my-profile")
-    )._databricks_api_request("/clusters/list", "PUT", json={"a": "b"})
-    assert json.loads(response.text) == {"OK": "woo"}
-    assert get_config.call_count == 0
 
-
-@mock.patch("mlflow.utils.databricks_utils.get_databricks_host_creds")
-def test_run_databricks_failed(_):
+def test_run_databricks_failed():
     text = '{"error_code": "RESOURCE_DOES_NOT_EXIST", "message": "Node type not supported"}'
-    with mock.patch(
-        "mlflow.utils.rest_utils.http_request", return_value=mock.Mock(text=text, status_code=400)
+    with (
+        mock.patch("mlflow.utils.databricks_utils.get_databricks_host_creds"),
+        mock.patch(
+            "mlflow.utils.rest_utils.http_request",
+            return_value=mock.Mock(text=text, status_code=400),
+        ),
     ):
         runner = DatabricksJobRunner(construct_db_uri_from_profile("profile"))
         with pytest.raises(

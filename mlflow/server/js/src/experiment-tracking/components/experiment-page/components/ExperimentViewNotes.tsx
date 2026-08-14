@@ -5,13 +5,14 @@ import { useDispatch, useSelector } from 'react-redux';
 import { CollapsibleSection } from '../../../../common/components/CollapsibleSection';
 import { EditableNote } from '../../../../common/components/EditableNote';
 import { getExperimentTags } from '../../../reducers/Reducers';
-import { ExperimentEntity, KeyValueEntity } from '../../../types';
+import type { ExperimentEntity } from '../../../types';
+import type { KeyValueEntity } from '../../../../common/types';
 import { NOTE_CONTENT_TAG } from '../../../utils/NoteUtils';
 import { useFetchExperiments } from '../hooks/useFetchExperiments';
-import { ThunkDispatch } from '../../../../redux-types';
+import type { ThunkDispatch } from '../../../../redux-types';
 
 const extractNoteFromTags = (tags: Record<string, KeyValueEntity>) =>
-  Object.values(tags).find((t) => t.getKey() === NOTE_CONTENT_TAG)?.value || undefined;
+  Object.values(tags).find((t) => t.key === NOTE_CONTENT_TAG)?.value || undefined;
 
 export interface ExperimentViewNotesProps {
   experiment: ExperimentEntity;
@@ -23,9 +24,10 @@ export interface ExperimentViewNotesProps {
  * Consumes note from the redux store and dispatches
  * `setExperimentTagApi` redux action from the context.
  */
+// eslint-disable-next-line react-component-name/react-component-name -- TODO(FEINF-4716)
 export const ExperimentViewNotes = React.memo(({ experiment }: ExperimentViewNotesProps) => {
   const storedNote = useSelector((state) => {
-    const tags = getExperimentTags(experiment.experiment_id, state);
+    const tags = getExperimentTags(experiment.experimentId, state);
     return tags ? extractNoteFromTags(tags) : '';
   });
 
@@ -39,10 +41,10 @@ export const ExperimentViewNotes = React.memo(({ experiment }: ExperimentViewNot
 
   const handleSubmitEditNote = useCallback(
     (updatedNote: any) => {
-      const action = setExperimentTagApi(experiment.experiment_id, NOTE_CONTENT_TAG, updatedNote);
+      const action = setExperimentTagApi(experiment.experimentId, NOTE_CONTENT_TAG, updatedNote);
       dispatch(action).then(() => setShowNotesEditor(false));
     },
-    [experiment.experiment_id, setExperimentTagApi, dispatch],
+    [experiment.experimentId, setExperimentTagApi, dispatch],
   );
 
   return (
@@ -61,7 +63,6 @@ export const ExperimentViewNotes = React.memo(({ experiment }: ExperimentViewNot
             >
               <FormattedMessage
                 defaultMessage="Edit"
-                // eslint-disable-next-line max-len
                 description="Text for the edit button next to the description section title on the experiment view page"
               />
             </Button>
@@ -70,7 +71,7 @@ export const ExperimentViewNotes = React.memo(({ experiment }: ExperimentViewNot
       }
       forceOpen={showNotesEditor}
       defaultCollapsed={!storedNote}
-      data-test-id="experiment-notes-section"
+      data-testid="experiment-notes-section"
     >
       <EditableNote
         defaultMarkdown={storedNote}

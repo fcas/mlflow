@@ -1,18 +1,26 @@
+import { jest, describe, beforeAll, beforeEach, afterAll, test, expect } from '@jest/globals';
 import { mount } from 'enzyme';
 import { EXPERIMENT_RUNS_MOCK_STORE } from '../../fixtures/experiment-runs.fixtures';
-import { SearchExperimentRunsFacetsState } from '../../models/SearchExperimentRunsFacetsState';
-import { SearchExperimentRunsViewState } from '../../models/SearchExperimentRunsViewState';
+import { ExperimentPageViewState } from '../../models/ExperimentPageViewState';
 import { useRunsColumnDefinitions } from '../../utils/experimentPage.column-utils';
-import { ExperimentViewRunsTable, ExperimentViewRunsTableProps } from './ExperimentViewRunsTable';
+import type { ExperimentViewRunsTableProps } from './ExperimentViewRunsTable';
+import { ExperimentViewRunsTable } from './ExperimentViewRunsTable';
 import { MemoryRouter } from '../../../../../common/utils/RoutingUtils';
-import { createExperimentPageUIStateV2 } from '../../models/ExperimentPageUIStateV2';
+import { createExperimentPageUIState } from '../../models/ExperimentPageUIState';
+import { createExperimentPageSearchFacetsState } from '../../models/ExperimentPageSearchFacetsState';
+import { ExperimentPageUIStateContextProvider } from '../../contexts/ExperimentPageUIStateContext';
+import { MockedReduxStoreProvider } from '../../../../../common/utils/TestUtils';
+import { COLUMN_TYPES } from '@mlflow/mlflow/src/experiment-tracking/constants';
+import { makeCanonicalSortKey } from '../../utils/experimentPage.common-utils';
 
 /**
  * Mock all expensive utility functions
  */
 jest.mock('../../utils/experimentPage.column-utils', () => ({
-  ...jest.requireActual('../../utils/experimentPage.column-utils'),
-  useRunsColumnDefinitions: jest.fn().mockImplementation(() => []),
+  ...jest.requireActual<typeof import('../../utils/experimentPage.column-utils')>(
+    '../../utils/experimentPage.column-utils',
+  ),
+  useRunsColumnDefinitions: jest.fn(() => []),
 }));
 
 /**
@@ -41,25 +49,34 @@ const mockGridApi = {
   resetRowHeights: jest.fn(),
 };
 
-jest.mock('../../../../../common/components/ag-grid/AgGridLoader', () => {
-  const columnApiMock = {};
-  return {
-    MLFlowAgGridLoader: ({ onGridReady }: any) => {
-      onGridReady({
-        api: mockGridApi,
-        columnApi: columnApiMock,
-      });
-      return <div />;
-    },
-  };
-});
+const mockColumnApi: any = {
+  getAllGridColumns: jest.fn(() => []),
+  getAllDisplayedColumns: jest.fn(() => []),
+  getColumnState: jest.fn(() => []),
+  applyColumnState: jest.fn(),
+  resetColumnState: jest.fn(),
+};
+
+// Captures the latest props passed to the grid so tests can fire column events.
+const mockAgGridProps: { current: any } = { current: null };
+
+jest.mock('../../../../../common/components/ag-grid/AgGridLoader', () => ({
+  MLFlowAgGridLoader: (props: any) => {
+    mockAgGridProps.current = props;
+    props.onGridReady({
+      api: mockGridApi,
+      columnApi: mockColumnApi,
+    });
+    return <div />;
+  },
+}));
 
 /**
  * Mock <FormattedMessage /> instead of providing intl context to make
  * settings enzyme wrapper's props prossible
  */
 jest.mock('react-intl', () => ({
-  ...jest.requireActual('react-intl'),
+  ...jest.requireActual<typeof import('react-intl')>('react-intl'),
   FormattedMessage: () => <div />,
 }));
 
@@ -73,6 +90,14 @@ describe('ExperimentViewRunsTable', () => {
 
   afterAll(() => {
     jest.useRealTimers();
+  });
+
+  beforeEach(() => {
+    mockColumnApi.getAllGridColumns.mockReturnValue([]);
+    mockColumnApi.getAllDisplayedColumns.mockReturnValue([]);
+    mockColumnApi.getColumnState.mockReturnValue([]);
+    mockColumnApi.applyColumnState.mockClear();
+    mockColumnApi.resetColumnState.mockClear();
   });
 
   const defaultProps: ExperimentViewRunsTableProps = {
@@ -90,25 +115,81 @@ describe('ExperimentViewRunsTable', () => {
       runUuidsMatchingFilter: ['experiment123456789_run1'],
     } as any,
     rowsData: [{ runUuid: 'experiment123456789_run1' } as any],
-    searchFacetsState: Object.assign(new SearchExperimentRunsFacetsState(), {
+    searchFacetsState: Object.assign(createExperimentPageSearchFacetsState(), {
       runsPinned: ['experiment123456789_run1'],
     }),
-    viewState: new SearchExperimentRunsViewState(),
-    uiState: createExperimentPageUIStateV2(),
-    updateSearchFacets() {},
+    viewState: new ExperimentPageViewState(),
+    uiState: createExperimentPageUIState(),
     updateViewState() {},
     loadMoreRunsFunc: jest.fn(),
     expandRows: false,
+    compareRunsMode: 'TABLE',
   };
 
   const createWrapper = (additionalProps: Partial<ExperimentViewRunsTableProps> = {}) =>
     mount(<ExperimentViewRunsTable {...defaultProps} {...additionalProps} />, {
-      wrappingComponent: MemoryRouter,
+      wrappingComponent: ({ children }: React.PropsWithChildren<unknown>) => (
+        <MemoryRouter>
+          <MockedReduxStoreProvider>{children}</MockedReduxStoreProvider>
+        </MemoryRouter>
+      ),
     });
+
+  // Wraps the table with a UI-state context whose setter is a spy, so tests can
+  // assert what column persistence writes via `updateUIState`.
+  const createWrapperWithUIStateSpy = (
+    setUIState: jest.Mock,
+    additionalProps: Partial<ExperimentViewRunsTableProps> = {},
+  ) =>
+    mount(<ExperimentViewRunsTable {...defaultProps} {...additionalProps} />, {
+      wrappingComponent: ({ children }: React.PropsWithChildren<unknown>) => (
+        <MemoryRouter>
+          <MockedReduxStoreProvider>
+            <ExperimentPageUIStateContextProvider setUIState={setUIState}>
+              {children}
+            </ExperimentPageUIStateContextProvider>
+          </MockedReduxStoreProvider>
+        </MemoryRouter>
+      ),
+    });
+
+  const mockColumn = (colId: string) => ({ getColId: () => colId, getColDef: () => ({}) });
+
+  const createLargeDatasetProps = (selectedKey: string, columnType: string) => {
+    const largeParamKeyList = Array.from({ length: 400 }, (_, i) => `p${i}`);
+    const largeMetricKeyList = Array.from({ length: 400 }, (_, i) => `m${i}`);
+    const largeTags: Record<string, { key: string; value: string }> = {};
+
+    // Add the selected key to the appropriate list
+    if (columnType === COLUMN_TYPES.PARAMS) {
+      largeParamKeyList.push(selectedKey);
+    } else if (columnType === COLUMN_TYPES.METRICS) {
+      largeMetricKeyList.push(selectedKey);
+    } else if (columnType === COLUMN_TYPES.TAGS) {
+      largeTags[selectedKey] = { key: selectedKey, value: 'testvalue' };
+    }
+
+    // Create enough tags to exceed threshold
+    for (let i = 0; i < 201; i++) {
+      largeTags[`tag${i}`] = { key: `tag${i}`, value: `value${i}` };
+    }
+
+    return {
+      runsData: {
+        ...defaultProps.runsData,
+        paramKeyList: largeParamKeyList,
+        metricKeyList: largeMetricKeyList,
+        tagsList: [largeTags],
+      },
+      uiState: Object.assign(createExperimentPageUIState(), {
+        selectedColumns: [makeCanonicalSortKey(columnType, selectedKey)],
+      }),
+    };
+  };
 
   test('should properly call creating column definitions function', () => {
     createWrapper();
-    expect(useRunsColumnDefinitions).toBeCalledWith(
+    expect(useRunsColumnDefinitions).toHaveBeenCalledWith(
       expect.objectContaining({
         selectedColumns: expect.anything(),
         compareExperiments: false,
@@ -120,12 +201,46 @@ describe('ExperimentViewRunsTable', () => {
     );
   });
 
+  test('should pass selected tag columns to column definitions', () => {
+    const tagKey = mockTagKeys[0];
+    createWrapper({
+      uiState: Object.assign(createExperimentPageUIState(), {
+        selectedColumns: [makeCanonicalSortKey(COLUMN_TYPES.TAGS, tagKey)],
+      }),
+    });
+    expect(useRunsColumnDefinitions).toHaveBeenCalledWith(expect.objectContaining({ tagKeyList: mockTagKeys }));
+  });
+
+  test('should filter tag columns when shouldOptimize is true', () => {
+    const tagKey = 'testtag1';
+    createWrapper(createLargeDatasetProps(tagKey, COLUMN_TYPES.TAGS));
+
+    const lastCall = jest.mocked(useRunsColumnDefinitions).mock.calls.slice(-1)[0][0] as any;
+    expect(lastCall.tagKeyList).toEqual([tagKey]);
+  });
+
+  test('should filter metric columns when shouldOptimize is true', () => {
+    const metricKey = 'testmetric1';
+    createWrapper(createLargeDatasetProps(metricKey, COLUMN_TYPES.METRICS));
+
+    const lastCall = jest.mocked(useRunsColumnDefinitions).mock.calls.slice(-1)[0][0] as any;
+    expect(lastCall.metricKeyList).toEqual([metricKey]);
+  });
+
+  test('should filter param columns when shouldOptimize is true', () => {
+    const paramKey = 'testparam1';
+    createWrapper(createLargeDatasetProps(paramKey, COLUMN_TYPES.PARAMS));
+
+    const lastCall = jest.mocked(useRunsColumnDefinitions).mock.calls.slice(-1)[0][0] as any;
+    expect(lastCall.paramKeyList).toEqual([paramKey]);
+  });
+
   test('should properly generate new column data on the new runs data', () => {
     const wrapper = createWrapper();
 
     // Assert that we're not calling for generating columns
     // while having "newparam" parameter
-    expect(useRunsColumnDefinitions).not.toBeCalledWith(
+    expect(useRunsColumnDefinitions).not.toHaveBeenCalledWith(
       expect.objectContaining({
         paramKeyList: ['p1', 'p2', 'p3', 'newparam'],
       }),
@@ -138,7 +253,7 @@ describe('ExperimentViewRunsTable', () => {
 
     // Assert that "newparam" parameter is being included in calls
     // for new columns
-    expect(useRunsColumnDefinitions).toBeCalledWith(
+    expect(useRunsColumnDefinitions).toHaveBeenCalledWith(
       expect.objectContaining({
         paramKeyList: ['p1', 'p2', 'p3', 'newparam'],
       }),
@@ -155,7 +270,7 @@ describe('ExperimentViewRunsTable', () => {
 
     // Set up some filter
     emptyExperimentsWrapper.setProps({
-      searchFacetsState: Object.assign(new SearchExperimentRunsFacetsState(), {
+      searchFacetsState: Object.assign(createExperimentPageSearchFacetsState(), {
         searchFilter: 'something',
       }),
     });
@@ -179,7 +294,7 @@ describe('ExperimentViewRunsTable', () => {
     const containingExperimentsWrapper = createWrapper({ moreRunsAvailable: false });
 
     // Assert "load more" row not being sent to agGrid
-    expect(mockGridApi.setRowData).not.toBeCalledWith(
+    expect(mockGridApi.setRowData).not.toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ isLoadMoreRow: true })]),
     );
 
@@ -189,7 +304,7 @@ describe('ExperimentViewRunsTable', () => {
     });
 
     // Assert "load more" row being added to payload
-    expect(mockGridApi.setRowData).toBeCalledWith(
+    expect(mockGridApi.setRowData).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ isLoadMoreRow: true })]),
     );
   });
@@ -203,7 +318,7 @@ describe('ExperimentViewRunsTable', () => {
     // Change the filtered run set so it mimics the scenario where used has unpinned the row
     wrapper.setProps({
       runsData: { ...defaultProps.runsData, runUuidsMatchingFilter: [] },
-      searchFacetsState: Object.assign(new SearchExperimentRunsFacetsState(), {
+      searchFacetsState: Object.assign(createExperimentPageSearchFacetsState(), {
         runsPinned: [],
       }),
     });
@@ -236,6 +351,7 @@ describe('ExperimentViewRunsTable', () => {
       'attributes.`Version`',
       'attributes.`Models`',
       'attributes.`Dataset`',
+      'attributes.`Description`',
     ];
 
     simpleExperimentsWrapper.setProps({
@@ -245,11 +361,11 @@ describe('ExperimentViewRunsTable', () => {
         paramKeyList: ['p1'],
         metricKeyList: ['m1'],
       },
-      searchFacetsState: Object.assign(new SearchExperimentRunsFacetsState(), {
+      searchFacetsState: Object.assign(createExperimentPageSearchFacetsState(), {
         // Exhaust all possible columns
         selectedColumns: newSelectedColumns,
       }),
-      uiState: Object.assign(createExperimentPageUIStateV2(), {
+      uiState: Object.assign(createExperimentPageUIState(), {
         // Exhaust all possible columns
         selectedColumns: newSelectedColumns,
       }),
@@ -257,5 +373,111 @@ describe('ExperimentViewRunsTable', () => {
 
     // Assert "show more columns" CTA button not being displayed anymore
     expect(simpleExperimentsWrapper.find('ExperimentViewRunsTableAddColumnCTA').length).toBe(0);
+  });
+
+  test('should hide column CTA when runs are selected', () => {
+    // Expect CTA to be displayed when no runs are selected
+    const wrapper = createWrapper();
+    expect(wrapper.find('ExperimentViewRunsTableAddColumnCTA').length).toBe(1);
+
+    // Select a run
+    wrapper.setProps({
+      viewState: Object.assign(new ExperimentPageViewState(), {
+        runsSelected: { experiment123456789_run1: true },
+      }),
+    });
+
+    // Expect CTA to be hidden when a run is selected
+    expect(wrapper.find('ExperimentViewRunsTableAddColumnCTA').length).toBe(0);
+
+    // Unselect the run
+    wrapper.setProps({
+      viewState: new ExperimentPageViewState(),
+    });
+
+    // Expect CTA to be displayed after unselecting
+    expect(wrapper.find('ExperimentViewRunsTableAddColumnCTA').length).toBe(1);
+  });
+
+  describe('column order/width persistence', () => {
+    test('persists order and widths on a user-driven column move (debounced)', () => {
+      const setUIState = jest.fn();
+      mockColumnApi.getAllDisplayedColumns.mockReturnValue([mockColumn('a'), mockColumn('b')]);
+      mockColumnApi.getColumnState.mockReturnValue([
+        { colId: 'b', width: 120 },
+        { colId: 'a', width: 90 },
+      ]);
+
+      createWrapperWithUIStateSpy(setUIState);
+      setUIState.mockClear();
+
+      mockAgGridProps.current.onColumnMoved({ columnApi: mockColumnApi, source: 'uiColumnMoved' });
+      // Nothing persisted until the debounce window elapses.
+      expect(setUIState).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(250);
+
+      expect(setUIState).toHaveBeenCalledTimes(1);
+      const updater = setUIState.mock.calls[0][0] as (s: any) => any;
+      const next = updater({ columnOrder: [], columnWidths: {} });
+      expect(next.columnOrder).toEqual(['b', 'a']);
+      expect(next.columnWidths).toEqual({ b: 120, a: 90 });
+    });
+
+    test('persists widths on a user-driven column resize once the gesture finishes', () => {
+      const setUIState = jest.fn();
+      mockColumnApi.getAllDisplayedColumns.mockReturnValue([mockColumn('a')]);
+      mockColumnApi.getColumnState.mockReturnValue([{ colId: 'a', width: 200 }]);
+
+      createWrapperWithUIStateSpy(setUIState);
+      setUIState.mockClear();
+
+      mockAgGridProps.current.onColumnResized({ columnApi: mockColumnApi, source: 'uiColumnResized', finished: true });
+      jest.advanceTimersByTime(250);
+
+      expect(setUIState).toHaveBeenCalledTimes(1);
+      const next = (setUIState.mock.calls[0][0] as (s: any) => any)({ columnOrder: [], columnWidths: {} });
+      expect(next.columnOrder).toEqual(['a']);
+      expect(next.columnWidths).toEqual({ a: 200 });
+    });
+
+    test('does not persist on non-user column events or unfinished resizes', () => {
+      const setUIState = jest.fn();
+      mockColumnApi.getAllDisplayedColumns.mockReturnValue([mockColumn('a')]);
+      mockColumnApi.getColumnState.mockReturnValue([{ colId: 'a', width: 200 }]);
+
+      createWrapperWithUIStateSpy(setUIState);
+      setUIState.mockClear();
+
+      // Programmatic move/resize (e.g. our own applyColumnState, flex sizing).
+      mockAgGridProps.current.onColumnMoved({ columnApi: mockColumnApi, source: 'api' });
+      mockAgGridProps.current.onColumnResized({ columnApi: mockColumnApi, source: 'flex', finished: true });
+      // Intermediate frame of a live resize drag.
+      mockAgGridProps.current.onColumnResized({ columnApi: mockColumnApi, source: 'uiColumnResized', finished: false });
+      jest.advanceTimersByTime(250);
+
+      expect(setUIState).not.toHaveBeenCalled();
+    });
+
+    test('restores persisted order and widths on grid-ready', () => {
+      createWrapper({
+        uiState: Object.assign(createExperimentPageUIState(), {
+          columnOrder: ['a', 'b'],
+          columnWidths: { a: 90 },
+        }),
+      });
+
+      expect(mockColumnApi.applyColumnState).toHaveBeenCalledWith({
+        state: [
+          { colId: 'a', width: 90 },
+          { colId: 'b', width: undefined },
+        ],
+        applyOrder: true,
+      });
+    });
+
+    test('does not apply column state when nothing has been persisted', () => {
+      createWrapper({ uiState: createExperimentPageUIState() });
+      expect(mockColumnApi.applyColumnState).not.toHaveBeenCalled();
+    });
   });
 });

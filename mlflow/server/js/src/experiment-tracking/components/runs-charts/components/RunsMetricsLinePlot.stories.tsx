@@ -1,7 +1,8 @@
 import { useCallback, useState } from 'react';
-import { RunInfoEntity } from '../../../types';
+import type { RunInfoEntity } from '../../../types';
 import { chartColors, ChartStoryWrapper, getRandomRunName, stableNormalRandom } from './RunsCharts.stories-common';
-import { RunsMetricsLinePlot, RunsMetricsLinePlotProps } from './RunsMetricsLinePlot';
+import type { RunsMetricsLinePlotProps } from './RunsMetricsLinePlot';
+import { RunsMetricsLinePlot } from './RunsMetricsLinePlot';
 import { RunsChartsLineChartXAxisType } from './RunsCharts.common';
 
 export default {
@@ -42,8 +43,8 @@ const createMockMetricsData = (
       uuid: `id-for-run-${runName}`,
       displayName: runName,
       runInfo: {
-        run_uuid: `id-for-run-${runName}`,
-        run_name: runName,
+        runUuid: `id-for-run-${runName}`,
+        runName: runName,
       } as RunInfoEntity,
       metricsHistory: { metric1: metricsHistory },
       color: chartColors[index % chartColors.length],

@@ -1,4 +1,6 @@
+import importlib.metadata
 import os
+from unittest import mock
 
 import pytest
 import yaml
@@ -16,7 +18,10 @@ from mlflow.utils.environment import (
     _parse_pip_requirements,
     _process_conda_env,
     _process_pip_requirements,
+    _remove_incompatible_requirements,
     _validate_env_arguments,
+    _validate_version_constraints,
+    infer_pip_requirements,
 )
 
 from tests.helper_functions import _mlflow_major_version_string
@@ -47,8 +52,6 @@ def test_mlflow_conda_env_returns_expected_env_dict_when_output_path_is_not_spec
 
 @pytest.mark.parametrize("conda_deps", [["conda-dep-1=0.0.1", "conda-dep-2"], None])
 def test_mlflow_conda_env_includes_pip_dependencies_but_pip_is_not_specified(conda_deps):
-    import pip
-
     additional_pip_deps = ["pip-dep==0.0.1"]
     env = _mlflow_conda_env(
         path=None, additional_conda_deps=conda_deps, additional_pip_deps=additional_pip_deps
@@ -56,7 +59,8 @@ def test_mlflow_conda_env_includes_pip_dependencies_but_pip_is_not_specified(con
     if conda_deps is not None:
         for conda_dep in conda_deps:
             assert conda_dep in env["dependencies"]
-    assert f"pip<={pip.__version__}" in env["dependencies"]
+    pip_version = importlib.metadata.version("pip")
+    assert f"pip<={pip_version}" in env["dependencies"]
 
 
 @pytest.mark.parametrize("pip_specification", ["pip", "pip==20.0.02"])
@@ -343,6 +347,40 @@ def test_process_conda_env(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("env_var", "fallbacks", "should_raise"),
+    [
+        # 1&2. If env var is True, always throw an exception from inference error
+        (True, ["sklearn"], True),
+        (True, None, True),
+        # 3. If env var is False but fallback is provided, should not throw an exception
+        (False, ["sklearn"], False),
+        # 4. If fallback is not provided, should throw an exception
+        (False, None, True),
+    ],
+)
+def test_infer_requirements_error_handling(env_var, fallbacks, should_raise, monkeypatch):
+    monkeypatch.setenv("MLFLOW_REQUIREMENTS_INFERENCE_RAISE_ERRORS", str(env_var))
+    # Disable UV auto-detect to ensure model-based inference is used
+    monkeypatch.setenv("MLFLOW_UV_AUTO_DETECT", "false")
+
+    call_args = ("path/to/model", "sklearn", fallbacks)
+    with mock.patch(
+        "mlflow.utils.requirements_utils._capture_imported_modules",
+        side_effect=MlflowException("Failed to capture imported modules"),
+    ):
+        if should_raise:
+            with pytest.raises(MlflowException, match="Failed to capture imported module"):
+                infer_pip_requirements(*call_args)
+        else:
+            # Should just pass with warning
+            with mock.patch("mlflow.utils.environment._logger.warning") as warning_mock:
+                infer_pip_requirements(*call_args)
+            warning_mock.assert_called_once()
+            warning_text = warning_mock.call_args[0][0]
+            assert "Encountered an unexpected error while inferring" in warning_text
+
+
+@pytest.mark.parametrize(
     ("input_requirements", "expected"),
     [
         # Simple cases
@@ -357,7 +395,7 @@ def test_process_conda_env(tmp_path):
             ["packageA[extras]", "packageB", "packageC<=2.0"],
         ),
         # Mixed versions and extras
-        (["markdown>=3.5.1", "markdown[extras]", "markdown<4"], ["markdown[extras]>=3.5.1,<4"]),
+        (["markdown>=3.5.1", "markdown[extras]", "markdown<4"], ["markdown[extras]<4,>=3.5.1"]),
         # Overlapping extras
         (
             ["packageZ[extra1]", "packageZ[extra2]", "packageZ"],
@@ -366,10 +404,10 @@ def test_process_conda_env(tmp_path):
         # No version on extras with final version on non-extras
         (
             ["markdown[extra1]", "markdown[extra2]", "markdown>3", "markdown<4"],
-            ["markdown[extra1,extra2]>3,<4"],
+            ["markdown[extra1,extra2]<4,>3"],
         ),
         # Version constraints with extras
-        (["markdown>1.0", "markdown[extras]<4"], ["markdown[extras]>1.0,<4"]),
+        (["markdown>1.0", "markdown[extras]<4"], ["markdown[extras]<4,>1.0"]),
         # Verify duplicate specifiers are not preserved
         (
             ["markdown==3.5.1", "markdown[extras]==3.5.1", "markdown[extras]"],
@@ -377,6 +415,31 @@ def test_process_conda_env(tmp_path):
         ),
         # Verify duplicate extras are not preserved
         (["markdown[extras]", "markdown", "markdown[extras]"], ["markdown[extras]"]),
+        # Marker-differentiated versions should be kept separate
+        (
+            [
+                "numpy==2.2.6 ; python_full_version < '3.11'",
+                "numpy==2.4.2 ; python_full_version >= '3.11'",
+            ],
+            [
+                'numpy==2.2.6; python_full_version < "3.11"',
+                'numpy==2.4.2; python_full_version >= "3.11"',
+            ],
+        ),
+        # Same marker should still merge
+        (
+            [
+                "numpy>=1.0 ; python_version >= '3.10'",
+                "numpy<2.0 ; python_version >= '3.10'",
+            ],
+            ['numpy<2.0,>=1.0; python_version >= "3.10"'],
+        ),
+        # Local version label on second entry - prefer non-local (PyPI-installable)
+        (["torch==2.7.1", "torch==2.7.1+cu128"], ["torch==2.7.1"]),
+        # Local version label on first entry - prefer non-local (PyPI-installable)
+        (["torch==2.7.1+cu128", "torch==2.7.1"], ["torch==2.7.1"]),
+        # Both have the same local label - should deduplicate normally
+        (["torch==2.7.1+cu128", "torch==2.7.1+cu128"], ["torch==2.7.1+cu128"]),
     ],
 )
 def test_deduplicate_requirements_resolve_correctly(input_requirements, expected):
@@ -394,6 +457,8 @@ def test_deduplicate_requirements_resolve_correctly(input_requirements, expected
         ["markdown<3", "markdown>3"],
         # Conflicting versions
         ["markdown==3.0", "markdown==3.5"],
+        # Differing local labels are a real conflict and should not be silently dropped
+        ["torch==2.7.1+cu128", "torch==2.7.1+cpu"],
     ],
 )
 def test_invalid_requirements_raise(input_requirements):
@@ -401,3 +466,31 @@ def test_invalid_requirements_raise(input_requirements):
         MlflowException, match="The specified requirements versions are incompatible"
     ):
         _deduplicate_requirements(input_requirements)
+
+
+def test_pip_requirements_validation_skipped_when_env_var_set(monkeypatch):
+    monkeypatch.setenv("MLFLOW_SKIP_PIP_REQUIREMENTS_CHECK", "true")
+
+    # _validate_version_constraints should return early without calling pip
+    _validate_version_constraints(["markdown<2.0", "markdown>3.0"])
+
+    # _deduplicate_requirements with incompatible constraints should not raise
+    result = _deduplicate_requirements(["markdown<3", "markdown>3"])
+    assert result == ["markdown<3,>3"]
+
+
+@pytest.mark.parametrize(
+    ("input_requirements", "expected"),
+    [
+        (["databricks-connect", "pyspark", "pyspark-connect"], ["databricks-connect"]),
+        (["databricks-connect==1.15.0", "pyspark==3.0.0"], ["databricks-connect==1.15.0"]),
+        (["databricks-connect==1.15.0", "pyspark-connect"], ["databricks-connect==1.15.0"]),
+        (["pyspark==3.0.0", "pyspark-connect"], ["pyspark==3.0.0", "pyspark-connect"]),
+        (
+            ["pyspark==3.0.0", "pyspark-connect==1.0.0"],
+            ["pyspark==3.0.0", "pyspark-connect==1.0.0"],
+        ),
+    ],
+)
+def test_remove_incompatible_requirements(input_requirements, expected):
+    assert _remove_incompatible_requirements(input_requirements) == expected

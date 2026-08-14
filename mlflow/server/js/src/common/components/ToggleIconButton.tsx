@@ -1,7 +1,12 @@
 import React from 'react';
 
 import type { ButtonProps } from '@databricks/design-system';
-import { useDesignSystemTheme } from '@databricks/design-system';
+import {
+  DesignSystemEventProviderAnalyticsEventTypes,
+  DesignSystemEventProviderComponentTypes,
+  useDesignSystemEventComponentCallbacks,
+  useDesignSystemTheme,
+} from '@databricks/design-system';
 
 export interface ToggleIconButtonProps extends ButtonProps {
   pressed?: boolean;
@@ -16,17 +21,40 @@ export interface ToggleIconButtonProps extends ButtonProps {
  * TODO: replace this component with the one from DuBois design system when available.
  */
 const ToggleIconButton = React.forwardRef<HTMLButtonElement, ToggleIconButtonProps>(
+  // eslint-disable-next-line react-component-name/react-component-name -- TODO(FEINF-4716)
   (props: ToggleIconButtonProps, ref) => {
-    const { pressed, onClick, icon, onBlur, onFocus, onMouseEnter, onMouseLeave, type, ...remainingProps } = props;
+    const {
+      pressed,
+      onClick,
+      icon,
+      onBlur,
+      onFocus,
+      onMouseEnter,
+      onMouseLeave,
+      componentId,
+      analyticsEvents,
+      type,
+      ...remainingProps
+    } = props;
     const { theme } = useDesignSystemTheme();
+
+    const eventContext = useDesignSystemEventComponentCallbacks({
+      componentType: DesignSystemEventProviderComponentTypes.Button,
+      componentId,
+      analyticsEvents: analyticsEvents ?? [DesignSystemEventProviderAnalyticsEventTypes.OnClick],
+    });
+
     return (
       <button
-        onClick={onClick}
+        onClick={(event) => {
+          eventContext.onClick(event);
+          onClick?.(event);
+        }}
         css={{
           cursor: 'pointer',
           width: theme.general.heightSm,
           height: theme.general.heightSm,
-          borderRadius: theme.borders.borderRadiusMd,
+          borderRadius: theme.legacyBorders.borderRadiusMd,
           lineHeight: theme.typography.lineHeightBase,
           padding: 0,
           border: 0,

@@ -14,19 +14,19 @@ from tests.gateway.tools import (
 @pytest.fixture(scope="module")
 def config():
     return {
-        "routes": [
+        "endpoints": [
             {
                 "name": "chat",
-                "route_type": "llm/v1/chat",
+                "endpoint_type": "llm/v1/chat",
                 "model": {
-                    "name": "gpt-3.5-turbo",
+                    "name": "gpt-4o-mini",
                     "provider": "openai",
                     "config": {"openai_api_key": "test"},
                 },
             },
             {
                 "name": "completions",
-                "route_type": "llm/v1/completions",
+                "endpoint_type": "llm/v1/completions",
                 "model": {
                     "name": "gpt-4",
                     "provider": "openai",
@@ -35,7 +35,7 @@ def config():
             },
             {
                 "name": "embeddings",
-                "route_type": "llm/v1/embeddings",
+                "endpoint_type": "llm/v1/embeddings",
                 "model": {
                     "provider": "openai",
                     "name": "text-embedding-ada-002",
@@ -67,7 +67,7 @@ def test_chat(client):
             "id": "chatcmpl-abc123",
             "object": "chat.completion",
             "created": 1677858242,
-            "model": "gpt-3.5-turbo-0301",
+            "model": "gpt-4o-mini",
             "choices": [
                 {
                     "message": {

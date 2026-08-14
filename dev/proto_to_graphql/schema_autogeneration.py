@@ -80,10 +80,11 @@ Given the GenerateSchemaState, generate the whole schema with Graphene.
 def generate_schema(state):
     schema_builder = ""
     schema_builder += "# GENERATED FILE. PLEASE DON'T MODIFY.\n"
-    schema_builder += "# Run python3 ./dev/proto_to_graphql/code_generator.py to regenerate.\n"
+    schema_builder += "# Run uv run ./dev/proto_to_graphql/code_generator.py to regenerate.\n"
     schema_builder += "import graphene\n"
     schema_builder += "import mlflow\n"
     schema_builder += "from mlflow.server.graphql.graphql_custom_scalars import LongString\n"
+    schema_builder += "from mlflow.server.graphql.graphql_errors import ApiError\n"
     schema_builder += "from mlflow.utils.proto_json_utils import parse_dict\n"
     schema_builder += "\n"
 
@@ -93,7 +94,7 @@ def generate_schema(state):
         for i in range(len(enum.values)):
             value = enum.values[i]
             # enum indices start from 1
-            schema_builder += f"""\n{INDENT}{value.name} = {i+1}"""
+            schema_builder += f"""\n{INDENT}{value.name} = {i + 1}"""
         schema_builder += "\n\n"
 
     for type in state.types:
@@ -102,6 +103,9 @@ def generate_schema(state):
         for field in type.fields:
             graphene_type = get_graphene_type_for_field(field, False)
             schema_builder += f"\n{INDENT}{camel_to_snake(field.name)} = {graphene_type}"
+
+        if type in state.outputs:
+            schema_builder += f"\n{INDENT}apiError = graphene.Field(ApiError)"
 
         if len(type.fields) == 0:
             schema_builder += f"\n{INDENT}{DUMMY_FIELD}"
@@ -168,7 +172,7 @@ def get_graphene_type_for_field(field, is_input):
             return f"graphene.List(graphene.NonNull({referenced_class_name}))"
         else:
             return f"graphene.Field({referenced_class_name})"
-    elif field.type == FieldDescriptor.TYPE_GROUP or field.type == FieldDescriptor.TYPE_MESSAGE:
+    elif field.type in (FieldDescriptor.TYPE_GROUP, FieldDescriptor.TYPE_MESSAGE):
         if is_input:
             referenced_class_name = apply_schema_extension(
                 f"{get_descriptor_full_pascal_name(field.message_type)}Input"

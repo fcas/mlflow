@@ -5,9 +5,11 @@
  * annotations are already looking good, please remove this comment.
  */
 
+import { describe, beforeEach, jest, test, expect } from '@jest/globals';
 import React from 'react';
 import { shallow, mount } from 'enzyme';
 import ShowArtifactMapView from './ShowArtifactMapView';
+import { mountWithIntl } from '../../../common/utils/TestUtils.enzyme';
 
 describe('ShowArtifactMapView', () => {
   let wrapper: any;
@@ -34,6 +36,7 @@ describe('ShowArtifactMapView', () => {
     expect(wrapper.length).toBe(1);
   });
 
+  // eslint-disable-next-line jest/no-done-callback -- TODO(FEINF-1337)
   test('should render error message when error occurs', (done) => {
     const getArtifact = jest.fn((artifactLocation) => {
       return Promise.reject(new Error('my error text'));
@@ -55,6 +58,7 @@ describe('ShowArtifactMapView', () => {
     expect(wrapper.find('.artifact-map-view-loading').length).toBe(1);
   });
 
+  // eslint-disable-next-line jest/no-done-callback -- TODO(FEINF-1337)
   test('should render simple geoJSON in map view', (done) => {
     const getArtifact = jest.fn((artifactLocation) => {
       const geojson = {
@@ -73,7 +77,7 @@ describe('ShowArtifactMapView', () => {
     const div = global.document.createElement('div');
     global.document.body.appendChild(div);
     const props = { ...minimalProps, getArtifact: getArtifact };
-    wrapper = mount(<ShowArtifactMapView {...props} />, {
+    wrapper = mountWithIntl(<ShowArtifactMapView {...props} />, {
       attachTo: div,
     });
 
@@ -89,9 +93,10 @@ describe('ShowArtifactMapView', () => {
 
   test('should fetch artifacts on component update', () => {
     instance = wrapper.instance();
-    instance.fetchArtifacts = jest.fn();
+    // @ts-expect-error -- TODO(FEINF-4162)
+    jest.spyOn(instance, 'fetchArtifacts').mockImplementation();
     wrapper.setProps({ path: 'newpath', runUuid: 'newRunId' });
-    expect(instance.fetchArtifacts).toBeCalled();
-    expect(instance.props.getArtifact).toBeCalled();
+    expect(instance.fetchArtifacts).toHaveBeenCalled();
+    expect(instance.props.getArtifact).toHaveBeenCalled();
   });
 });

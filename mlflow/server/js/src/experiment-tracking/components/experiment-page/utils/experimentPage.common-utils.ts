@@ -1,8 +1,9 @@
-import { IntlShape } from 'react-intl';
+import type { IntlShape } from 'react-intl';
 import { saveAs } from 'file-saver';
-import { ExperimentEntity, KeyValueEntity } from '../../../types';
-import { ExperimentRunsSelectorResult } from './experimentRuns.selector';
-import { runInfosToCsv } from '../../../utils/CsvUtils';
+import type { ExperimentEntity } from '../../../types';
+import type { ExperimentRunsSelectorResult } from './experimentRuns.selector';
+import { chartDataToCsv, chartMetricHistoryToCsv, runInfosToCsv } from '../../../utils/CsvUtils';
+import type { RunsChartsRunData } from '../../runs-charts/components/RunsCharts.common';
 
 export const EXPERIMENT_FIELD_PREFIX_PARAM = '$$$param$$$';
 export const EXPERIMENT_FIELD_PREFIX_METRIC = '$$$metric$$$';
@@ -15,6 +16,13 @@ const MLFLOW_NOTEBOOK_TYPE = 'NOTEBOOK';
 const MLFLOW_EXPERIMENT_TYPE = 'MLFLOW_EXPERIMENT';
 
 const EXPERIMENT_TYPE_TAG = 'mlflow.experimentType';
+const EXPERIMENT_SOURCE_TYPE_TAG = 'mlflow.experiment.sourceType';
+const EXPERIMENT_SOURCE_ID_TAG = 'mlflow.experiment.sourceId';
+export const EXPERIMENT_IS_GATEWAY_TAG = 'mlflow.experiment.isGateway';
+
+enum ExperimentSourceType {
+  REPO_NOTEBOOK = 'REPO_NOTEBOOK',
+}
 
 /**
  * Function that gets the experiment type for a given experiment object
@@ -42,11 +50,37 @@ export const isExperimentTypeNotebook = (experiment: ExperimentEntity) =>
   hasExperimentType(experiment, MLFLOW_NOTEBOOK_TYPE);
 
 /**
- * Function that checks if experiment's allowed actions include
- * modification. TODO: fix typo in the const name.
+ * Returns true when the server included an `allowedActions` restriction list.
  */
-export const canModifyExperiment = (experiment: ExperimentEntity) =>
-  experiment.allowed_actions.includes('MODIFIY_PERMISSION');
+const hasAllowedActionsRestriction = (experiment: ExperimentEntity) => experiment.allowedActions !== undefined;
+
+const hasAllowedAction = (experiment: ExperimentEntity, action: string) =>
+  !hasAllowedActionsRestriction(experiment) || (experiment.allowedActions || []).includes(action);
+
+/**
+ * Returns whether experiment metadata can be modified.
+ *
+ * Note that `allowedActions === undefined` is treated as unrestricted because the backend did
+ * not provide an explicit restriction list. The `MODIFIY_PERMISSION` action name intentionally
+ * preserves the existing backend typo.
+ */
+export const canModifyExperiment = (experiment: ExperimentEntity) => hasAllowedAction(experiment, 'MODIFIY_PERMISSION');
+
+export const canRenameExperiment = (experiment: ExperimentEntity) => hasAllowedAction(experiment, 'RENAME');
+
+export const canDeleteExperiment = (experiment: ExperimentEntity) => hasAllowedAction(experiment, 'DELETE');
+
+/**
+ * Function that gets the experiment source ID for a given experiment object
+ */
+export const getExperimentSourceId = (experiment: ExperimentEntity) =>
+  experiment.tags?.find((tag) => tag.key === EXPERIMENT_SOURCE_ID_TAG)?.value;
+
+/**
+ * Function that checks if experiment comes from repository notebook
+ */
+export const isRepoNotebookExperiment = (experiment: ExperimentEntity) =>
+  experiment.tags?.find((tag) => tag.key === EXPERIMENT_SOURCE_TYPE_TAG)?.value === ExperimentSourceType.REPO_NOTEBOOK;
 
 /**
  * Function used for downloading run data in CSV form.
@@ -70,6 +104,29 @@ export const downloadRunsCsv = (
   });
   const blob = new Blob([csv], { type: 'application/csv;charset=utf-8' });
   saveAs(blob, 'runs.csv');
+};
+
+/**
+ * Function used for downloading metric history chart data in CSV form.
+ */
+export const downloadChartMetricHistoryCsv = (traces: RunsChartsRunData[], metricKeys: string[], title: string) => {
+  const csv = chartMetricHistoryToCsv(traces, metricKeys);
+  const blob = new Blob([csv], { type: 'application/csv;charset=utf-8' });
+  saveAs(blob, `${title}.csv`);
+};
+
+/**
+ * Function used for downloading latest chart data in CSV form.
+ */
+export const downloadChartDataCsv = (
+  traces: RunsChartsRunData[],
+  metricKeys: string[],
+  paramKeys: string[],
+  title: string,
+) => {
+  const csv = chartDataToCsv(traces, metricKeys, paramKeys);
+  const blob = new Blob([csv], { type: 'application/csv;charset=utf-8' });
+  saveAs(blob, `${title}.csv`);
 };
 
 /**
@@ -104,7 +161,13 @@ export const getStartTimeColumnDisplayName = (intl: IntlShape) => ({
  */
 export const getQualifiedEntityName = (keyType: string, keyName: string) => {
   let replace = '';
-  if (keyName.includes('"') || keyName.includes(' ') || keyName.includes('.')) {
+  if (
+    keyName.includes('"') ||
+    keyName.includes(' ') ||
+    keyName.includes('.') ||
+    keyName.includes('(') ||
+    keyName.includes(')')
+  ) {
     replace = '`';
   }
   if (keyName.includes('`')) {
@@ -113,15 +176,15 @@ export const getQualifiedEntityName = (keyType: string, keyName: string) => {
   return `${keyType}.${replace}${keyName}${replace}`;
 };
 
-export const makeCanonicalSortKey = (keyType: string, keyName: string) => keyType + '.`' + keyName + '`';
 /**
  * Creates canonical sort key name for metrics and params
  */
+export const makeCanonicalSortKey = (keyType: string, keyName: string) => keyType + '.`' + keyName + '`';
 
 export const isCanonicalSortKeyOfType = (canonicalKey: string, keyType: string) => canonicalKey.startsWith(keyType);
+
 /**
  * Extracts param/metric/tag name from the canonical key
  */
-
 export const extractCanonicalSortKey = (canonicalKey: string, keyType: string) =>
   canonicalKey.substring(keyType.length + 2).slice(0, -1);

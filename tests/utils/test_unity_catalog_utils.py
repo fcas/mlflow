@@ -1,7 +1,10 @@
 import pytest
 
+from mlflow.entities.logged_model_parameter import LoggedModelParameter as ModelParam
+from mlflow.entities.metric import Metric
 from mlflow.entities.model_registry import (
     ModelVersion,
+    ModelVersionDeploymentJobState,
     ModelVersionTag,
     RegisteredModel,
     RegisteredModelAlias,
@@ -9,6 +12,12 @@ from mlflow.entities.model_registry import (
 )
 from mlflow.entities.model_registry.model_version_search import ModelVersionSearch
 from mlflow.entities.model_registry.registered_model_search import RegisteredModelSearch
+from mlflow.protos.databricks_uc_registry_messages_pb2 import (
+    EncryptionDetails,
+    SseEncryptionAlgorithm,
+    SseEncryptionDetails,
+    TemporaryCredentials,
+)
 from mlflow.protos.databricks_uc_registry_messages_pb2 import ModelVersion as ProtoModelVersion
 from mlflow.protos.databricks_uc_registry_messages_pb2 import (
     ModelVersionStatus as ProtoModelVersionStatus,
@@ -25,7 +34,33 @@ from mlflow.protos.databricks_uc_registry_messages_pb2 import (
 from mlflow.protos.databricks_uc_registry_messages_pb2 import (
     RegisteredModelTag as ProtoRegisteredModelTag,
 )
+from mlflow.protos.unity_catalog_messages_pb2 import (
+    DeploymentJobConnection,
+    ModelVersionInfo,
+    RegisteredModelAliasInfo,
+    RegisteredModelInfo,
+    TagKeyValue,
+)
+from mlflow.protos.unity_catalog_messages_pb2 import (
+    ModelMetric as OssProtoModelMetric,
+)
+from mlflow.protos.unity_catalog_messages_pb2 import (
+    ModelParam as OssProtoModelParam,
+)
+from mlflow.protos.unity_catalog_messages_pb2 import (
+    ModelVersionDeploymentJobState as OssProtoModelVersionDeploymentJobState,
+)
+from mlflow.protos.unity_catalog_messages_pb2 import (
+    ModelVersionStatus as OssProtoModelVersionStatus,
+)
+from mlflow.store._unity_catalog.registry.uc_native_rest_store import (
+    model_version_from_uc_native_proto,
+    model_version_search_from_uc_native_proto,
+    registered_model_from_uc_native_proto,
+    registered_model_search_from_uc_native_proto,
+)
 from mlflow.utils._unity_catalog_utils import (
+    _parse_aws_sse_credential,
     model_version_from_uc_proto,
     model_version_search_from_uc_proto,
     registered_model_from_uc_proto,
@@ -33,7 +68,23 @@ from mlflow.utils._unity_catalog_utils import (
 )
 
 
-def test_model_version_from_uc_proto():
+@pytest.mark.parametrize(
+    "run_state",
+    [
+        "DEPLOYMENT_JOB_RUN_STATE_UNSPECIFIED",
+        "NO_VALID_DEPLOYMENT_JOB_FOUND",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "PENDING",
+        "APPROVAL",
+    ],
+)
+def test_model_version_from_uc_proto(run_state):
+    from mlflow.protos.databricks_uc_registry_messages_pb2 import (
+        ModelVersionDeploymentJobState as ProtoModelVersionDeploymentJobState,
+    )
+
     expected_model_version = ModelVersion(
         name="name",
         version="1",
@@ -50,7 +101,27 @@ def test_model_version_from_uc_proto():
             ModelVersionTag(key="key1", value="value"),
             ModelVersionTag(key="key2", value=""),
         ],
+        metrics=[],
+        model_id="",
+        params=[],
+        deployment_job_state=ModelVersionDeploymentJobState(
+            "job_123",
+            "run_456",
+            "DEPLOYMENT_JOB_CONNECTION_STATE_UNSPECIFIED",
+            run_state,
+            "task_name",
+        ),
     )
+
+    # Create protobuf with deployment job state
+    deployment_job_state_proto = ProtoModelVersionDeploymentJobState(
+        job_id="job_123",
+        run_id="run_456",
+        job_state=0,  # DEPLOYMENT_JOB_CONNECTION_STATE_UNSPECIFIED
+        run_state=ProtoModelVersionDeploymentJobState.DeploymentJobRunState.Value(run_state),
+        current_task_name="task_name",
+    )
+
     uc_proto = ProtoModelVersion(
         name="name",
         version="1",
@@ -70,6 +141,7 @@ def test_model_version_from_uc_proto():
             ProtoModelVersionTag(key="key1", value="value"),
             ProtoModelVersionTag(key="key2", value=""),
         ],
+        deployment_job_state=deployment_job_state_proto,
     )
     actual_model_version = model_version_from_uc_proto(uc_proto)
     assert actual_model_version == expected_model_version
@@ -89,6 +161,13 @@ def test_model_version_search_from_uc_proto():
         status_message="status_message",
         aliases=[],
         tags=[],
+        deployment_job_state=ModelVersionDeploymentJobState(
+            "",
+            "",
+            "DEPLOYMENT_JOB_CONNECTION_STATE_UNSPECIFIED",
+            "DEPLOYMENT_JOB_RUN_STATE_UNSPECIFIED",
+            "",
+        ),
     )
     uc_proto = ProtoModelVersion(
         name="name",
@@ -166,6 +245,8 @@ def test_registered_model_from_uc_proto():
             RegisteredModelTag(key="key1", value="value"),
             RegisteredModelTag(key="key2", value=""),
         ],
+        deployment_job_id="",
+        deployment_job_state="DEPLOYMENT_JOB_CONNECTION_STATE_UNSPECIFIED",
     )
     uc_proto = ProtoRegisteredModel(
         name="name",
@@ -245,3 +326,230 @@ def test_registered_model_and_registered_model_search_equality():
     registered_model_search_2 = RegisteredModelSearch(**kwargs)
 
     assert registered_model_2 == registered_model_search_2
+
+
+@pytest.mark.parametrize(
+    ("temp_credentials", "parsed"),
+    [
+        (TemporaryCredentials(), {}),
+        (
+            TemporaryCredentials(
+                encryption_details=EncryptionDetails(
+                    sse_encryption_details=SseEncryptionDetails(
+                        algorithm=SseEncryptionAlgorithm.SSE_ENCRYPTION_ALGORITHM_UNSPECIFIED
+                    )
+                )
+            ),
+            {},
+        ),
+        (
+            TemporaryCredentials(
+                encryption_details=EncryptionDetails(
+                    sse_encryption_details=SseEncryptionDetails(
+                        algorithm=SseEncryptionAlgorithm.AWS_SSE_KMS,
+                        aws_kms_key_arn="arn:aws:kms:us-west-2:111111111111:key/test-key-id",
+                    )
+                )
+            ),
+            {
+                "ServerSideEncryption": "aws:kms",
+                "SSEKMSKeyId": "arn:aws:kms:us-west-2:111111111111:key/test-key-id",
+            },
+        ),
+        (
+            TemporaryCredentials(
+                encryption_details=EncryptionDetails(
+                    sse_encryption_details=SseEncryptionDetails(
+                        algorithm=SseEncryptionAlgorithm.AWS_SSE_S3,
+                    )
+                )
+            ),
+            {
+                "ServerSideEncryption": "AES256",
+            },
+        ),
+    ],
+)
+def test_parse_aws_sse_credential(temp_credentials, parsed):
+    assert _parse_aws_sse_credential(temp_credentials) == parsed
+
+
+# ---------------------------------------------------------------------------
+# Enriched converters (native /api/2.1 governance + MLflow-enrichment surface). The governance
+# entity is flattened together with the enrichment fields, so these read the info proto directly.
+# ---------------------------------------------------------------------------
+
+
+def test_registered_model_from_uc_native_proto():
+    expected_registered_model = RegisteredModel(
+        name="catalog.schema.name",
+        creation_timestamp=1,
+        last_updated_timestamp=2,
+        description="description",
+        aliases=[
+            RegisteredModelAlias(alias="champion", version="3"),
+            RegisteredModelAlias(alias="challenger", version="5"),
+        ],
+        tags=[
+            RegisteredModelTag(key="key1", value="value"),
+            RegisteredModelTag(key="key2", value=""),
+        ],
+        deployment_job_id="job_42",
+        deployment_job_state="CONNECTED",
+    )
+    uc_proto = RegisteredModelInfo(
+        name="name",
+        catalog_name="catalog",
+        schema_name="schema",
+        full_name="catalog.schema.name",
+        comment="description",
+        created_at=1,
+        updated_at=2,
+        aliases=[
+            RegisteredModelAliasInfo(alias_name="champion", version_num=3),
+            RegisteredModelAliasInfo(alias_name="challenger", version_num=5),
+        ],
+        tags=[
+            TagKeyValue(key="key1", value="value"),
+            TagKeyValue(key="key2", value=""),
+        ],
+        deployment_job_id="job_42",
+        deployment_job_state=DeploymentJobConnection.State.Value("CONNECTED"),
+    )
+    assert registered_model_from_uc_native_proto(uc_proto) == expected_registered_model
+
+
+def test_model_version_from_uc_native_proto():
+    expected_model_version = ModelVersion(
+        name="catalog.schema.model",
+        version="3",
+        creation_timestamp=1,
+        last_updated_timestamp=2,
+        description="description",
+        user_id="creator",
+        source="source",
+        run_id="run_id",
+        status="READY",
+        aliases=["champion"],
+        tags=[ModelVersionTag(key="k", value="v")],
+        model_id="m-123",
+        params=[ModelParam(key="p", value="1")],
+        metrics=[
+            Metric(
+                key="acc",
+                value=0.9,
+                timestamp=10,
+                step=1,
+                dataset_name="d",
+                dataset_digest="dig",
+                model_id="m-123",
+                run_id="run_id",
+            )
+        ],
+        deployment_job_state=ModelVersionDeploymentJobState(
+            "job_1",
+            "run_1",
+            "CONNECTED",
+            "RUNNING",
+            "task",
+        ),
+    )
+    uc_proto = ModelVersionInfo(
+        model_name="model",
+        catalog_name="catalog",
+        schema_name="schema",
+        comment="description",
+        source="source",
+        run_id="run_id",
+        status=OssProtoModelVersionStatus.Value("READY"),
+        version=3,
+        created_at=1,
+        updated_at=2,
+        created_by="creator",
+        aliases=[RegisteredModelAliasInfo(alias_name="champion", version_num=3)],
+        tags=[TagKeyValue(key="k", value="v")],
+        model_id="m-123",
+        model_params=[OssProtoModelParam(name="p", value="1")],
+        model_metrics=[
+            OssProtoModelMetric(
+                key="acc",
+                value=0.9,
+                timestamp=10,
+                step=1,
+                dataset_name="d",
+                dataset_digest="dig",
+                model_id="m-123",
+                run_id="run_id",
+            )
+        ],
+        deployment_job_state=OssProtoModelVersionDeploymentJobState(
+            job_id="job_1",
+            run_id="run_1",
+            job_state=DeploymentJobConnection.State.Value("CONNECTED"),
+            run_state=OssProtoModelVersionDeploymentJobState.DeploymentJobRunState.Value("RUNNING"),
+            current_task_name="task",
+        ),
+    )
+    assert model_version_from_uc_native_proto(uc_proto) == expected_model_version
+
+
+def test_registered_model_search_from_uc_native_proto():
+    expected_registered_model = RegisteredModelSearch(
+        name="catalog.schema.name",
+        creation_timestamp=1,
+        last_updated_timestamp=2,
+        description="description",
+        aliases=[],
+        tags=[],
+    )
+    uc_proto = RegisteredModelInfo(
+        name="name",
+        catalog_name="catalog",
+        schema_name="schema",
+        full_name="catalog.schema.name",
+        comment="description",
+        created_at=1,
+        updated_at=2,
+        aliases=[RegisteredModelAliasInfo(alias_name="champion", version_num=3)],
+        tags=[TagKeyValue(key="key1", value="value")],
+    )
+    assert registered_model_search_from_uc_native_proto(uc_proto) == expected_registered_model
+
+
+def test_model_version_search_from_uc_native_proto():
+    expected_model_version = ModelVersionSearch(
+        name="catalog.schema.model",
+        version="3",
+        creation_timestamp=1,
+        last_updated_timestamp=2,
+        description="description",
+        user_id="creator",
+        source="source",
+        run_id="run_id",
+        status="READY",
+        aliases=[],
+        tags=[],
+        deployment_job_state=ModelVersionDeploymentJobState(
+            "",
+            "",
+            "DEPLOYMENT_JOB_CONNECTION_STATE_UNSPECIFIED",
+            "DEPLOYMENT_JOB_RUN_STATE_UNSPECIFIED",
+            "",
+        ),
+    )
+    uc_proto = ModelVersionInfo(
+        model_name="model",
+        catalog_name="catalog",
+        schema_name="schema",
+        comment="description",
+        source="source",
+        run_id="run_id",
+        status=OssProtoModelVersionStatus.Value("READY"),
+        version=3,
+        created_at=1,
+        updated_at=2,
+        created_by="creator",
+        aliases=[RegisteredModelAliasInfo(alias_name="champion", version_num=3)],
+        tags=[TagKeyValue(key="k", value="v")],
+    )
+    assert model_version_search_from_uc_native_proto(uc_proto) == expected_model_version

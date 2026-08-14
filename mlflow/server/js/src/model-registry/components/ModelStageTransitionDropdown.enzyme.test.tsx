@@ -5,13 +5,14 @@
  * annotations are already looking good, please remove this comment.
  */
 
+import { describe, beforeEach, test, expect, jest } from '@jest/globals';
 import React from 'react';
 import { shallow } from 'enzyme';
 import { ModelStageTransitionDropdown } from './ModelStageTransitionDropdown';
 import { Stages } from '../constants';
 import { Dropdown } from '@databricks/design-system';
 import { mockGetFieldValue } from '../test-utils';
-import { mountWithIntl } from 'common/utils/TestUtils.enzyme';
+import { mountWithIntl } from '@mlflow/mlflow/src/common/utils/TestUtils.enzyme';
 
 describe('ModelStageTransitionDropdown', () => {
   let wrapper: any;
@@ -38,7 +39,7 @@ describe('ModelStageTransitionDropdown', () => {
       currentStage: Stages.STAGING,
     };
     wrapper = mountWithIntl(<ModelStageTransitionDropdown {...props} />);
-    wrapper.find('.stage-transition-dropdown').first().simulate('click');
+    wrapper.find('.mlflow-stage-transition-dropdown').first().simulate('click');
     const menuHtml = mountWithIntl(wrapper.find(Dropdown).props().overlay).html();
 
     expect(menuHtml).not.toContain(Stages.STAGING);
@@ -66,7 +67,9 @@ describe('ModelStageTransitionDropdown', () => {
         },
       };
       instance.handleMenuItemClick(activity);
-      instance.state.handleConfirm();
+      instance.state.handleConfirm({
+        archiveExistingVersions: fieldValue,
+      });
       // eslint-disable-next-line jest/no-standalone-expect
       expect(mockOnSelect).toHaveBeenCalledWith(activity, expectArchiveFieldValue);
     });

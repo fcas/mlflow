@@ -26,22 +26,20 @@ print(
 )
 with mlflow.start_run():
     model_info = mlflow.openai.log_model(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[{"role": "user", "content": "Tell me a joke about {animal}."}],
     )
 
 
 model = mlflow.pyfunc.load_model(model_info.model_uri)
-df = pd.DataFrame(
-    {
-        "animal": [
-            "cats",
-            "dogs",
-        ]
-    }
-)
+df = pd.DataFrame({
+    "animal": [
+        "cats",
+        "dogs",
+    ]
+})
 print(model.predict(df))
 
 list_of_dicts = [
@@ -64,20 +62,18 @@ print(
 )
 with mlflow.start_run():
     model_info = mlflow.openai.log_model(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[{"role": "user", "content": "Tell me a {adjective} joke about {animal}."}],
     )
 
 
 model = mlflow.pyfunc.load_model(model_info.model_uri)
-df = pd.DataFrame(
-    {
-        "adjective": ["funny", "scary"],
-        "animal": ["cats", "dogs"],
-    }
-)
+df = pd.DataFrame({
+    "adjective": ["funny", "scary"],
+    "animal": ["cats", "dogs"],
+})
 print(model.predict(df))
 
 
@@ -96,9 +92,9 @@ print(
 )
 with mlflow.start_run():
     model_info = mlflow.openai.log_model(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[
             {"role": "system", "content": "You are {person}"},
             {"role": "user", "content": "Let me hear your thoughts on {topic}"},
@@ -107,12 +103,10 @@ with mlflow.start_run():
 
 
 model = mlflow.pyfunc.load_model(model_info.model_uri)
-df = pd.DataFrame(
-    {
-        "person": ["Elon Musk", "Jeff Bezos"],
-        "topic": ["AI", "ML"],
-    }
-)
+df = pd.DataFrame({
+    "person": ["Elon Musk", "Jeff Bezos"],
+    "topic": ["AI", "ML"],
+})
 print(model.predict(df))
 
 list_of_dicts = [
@@ -131,21 +125,19 @@ print(
 )
 with mlflow.start_run():
     model_info = mlflow.openai.log_model(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[{"role": "system", "content": "You are Elon Musk"}],
     )
 
 model = mlflow.pyfunc.load_model(model_info.model_uri)
-df = pd.DataFrame(
-    {
-        "question": [
-            "Let me hear your thoughts on AI",
-            "Let me hear your thoughts on ML",
-        ],
-    }
-)
+df = pd.DataFrame({
+    "question": [
+        "Let me hear your thoughts on AI",
+        "Let me hear your thoughts on ML",
+    ],
+})
 print(model.predict(df))
 
 list_of_dicts = [
@@ -172,29 +164,25 @@ print(
 )
 with mlflow.start_run():
     model_info = mlflow.openai.log_model(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[{"role": "user", "content": "Tell me a joke about {animal}."}],
         signature=ModelSignature(
             inputs=Schema([ColSpec(type="string", name=None)]),
             outputs=Schema([ColSpec(type="string", name=None)]),
-            params=ParamSchema(
-                [
-                    ParamSpec(name="temperature", default=0, dtype="float"),
-                ]
-            ),
+            params=ParamSchema([
+                ParamSpec(name="temperature", default=0, dtype="float"),
+            ]),
         ),
     )
 
 
 model = mlflow.pyfunc.load_model(model_info.model_uri)
-df = pd.DataFrame(
-    {
-        "animal": [
-            "cats",
-            "dogs",
-        ]
-    }
-)
+df = pd.DataFrame({
+    "animal": [
+        "cats",
+        "dogs",
+    ]
+})
 print(model.predict(df, params={"temperature": 1}))

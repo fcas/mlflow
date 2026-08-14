@@ -11,30 +11,39 @@ import {
   GET_EXPERIMENT_API,
   GET_RUN_API,
   LIST_ARTIFACTS_API,
-  SEARCH_EXPERIMENTS_API,
+  LIST_ARTIFACTS_LOGGED_MODEL_API,
   OPEN_ERROR_MODAL,
   SEARCH_RUNS_API,
   LOAD_MORE_RUNS_API,
   SET_EXPERIMENT_TAG_API,
+  DELETE_EXPERIMENT_TAG_API,
   SET_TAG_API,
   DELETE_TAG_API,
   SET_COMPARE_EXPERIMENTS,
   SEARCH_DATASETS_API,
 } from '../actions';
-import { Experiment, Param, RunInfo, RunTag, ExperimentTag } from '../sdk/MlflowMessages';
+import { Param, RunTag, ExperimentTag } from '../sdk/MlflowMessages';
 import { ArtifactNode } from '../utils/ArtifactUtils';
 import { metricsByRunUuid, latestMetricsByRunUuid, minMetricsByRunUuid, maxMetricsByRunUuid } from './MetricReducer';
 import modelRegistryReducers from '../../model-registry/reducers';
-import _, { isArray, update } from 'lodash';
+import { isArray, isEqual, merge, update, intersection, omit, union } from 'lodash';
 import { fulfilled, isFulfilledApi, isPendingApi, isRejectedApi, rejected } from '../../common/utils/ActionUtils';
 import { SEARCH_MODEL_VERSIONS } from '../../model-registry/actions';
 import { getProtoField } from '../../model-registry/utils';
 import Utils from '../../common/utils/Utils';
 import { evaluationDataReducer as evaluationData } from './EvaluationDataReducer';
-import { modelGatewayReducer as modelGateway } from './/ModelGatewayReducer';
-import type { DatasetSummary, ModelVersionInfoEntity } from 'experiment-tracking/types';
+import { modelGatewayReducer as modelGateway } from './ModelGatewayReducer';
+import type {
+  DatasetSummary,
+  ExperimentEntity,
+  ModelVersionInfoEntity,
+  RunInfoEntity,
+} from '@mlflow/mlflow/src/experiment-tracking/types';
 import { sampledMetricsByRunUuid } from './SampledMetricsReducer';
-import { ErrorWrapper } from '../../common/utils/ErrorWrapper';
+import type { ErrorWrapper } from '../../common/utils/ErrorWrapper';
+import { imagesByRunUuid } from './ImageReducer';
+import { colorByRunUuid } from './RunColorReducer';
+import { runInputsOutputsByUuid } from './InputsOutputsReducer';
 
 export type ApisReducerReduxState = Record<
   string,
@@ -51,7 +60,7 @@ export type ComparedExperimentsReducerReduxState = {
   hasComparedExperimentsBefore: boolean;
 };
 
-export const getExperiments = (state: any) => {
+export const getExperiments = (state: any): ExperimentEntity[] => {
   return Object.values(state.entities.experimentsById);
 };
 
@@ -61,36 +70,14 @@ export const getExperiment = (id: any, state: any) => {
 
 export const experimentsById = (state = {}, action: any): any => {
   switch (action.type) {
-    case fulfilled(SEARCH_EXPERIMENTS_API): {
-      let newState = Object.assign({}, state);
-      if (action.payload && action.payload.experiments) {
-        // reset experimentsById state
-        // doing this enables us to capture if an experiment was deleted
-        // if we kept the old state and updated the experiments based on their id,
-        // deleted experiments (via CLI or UI) would remain until the page is refreshed
-        newState = {};
-        action.payload.experiments.forEach((eJson: any) => {
-          const experiment = (Experiment as any).fromJs(eJson);
-          newState = Object.assign(newState, { [experiment.getExperimentId()]: experiment });
-        });
-      }
-      return newState;
-    }
     case fulfilled(GET_EXPERIMENT_API): {
       const { experiment } = action.payload;
 
-      // getExperiment API response might not contain all relevant fields,
-      // thus instead of overwriting it, we rather want to merge the new data
-      // into the existing record. We're replacing it only if no experiment
-      // with this ID exists in the state.
-      const mergedExperiment =
-        // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-        state[experiment.experiment_id]?.mergeDeep((Experiment as any).fromJs(experiment)) ||
-        (Experiment as any).fromJs(experiment);
+      const existingExperiment = (state as any)[experiment.experimentId] || {};
 
       return {
         ...state,
-        [experiment.experiment_id]: mergedExperiment,
+        [experiment.experimentId]: merge({}, existingExperiment, experiment),
       };
     }
     default:
@@ -114,7 +101,7 @@ export const runUuidsMatchingFilter = (state = [], action: any) => {
       const newState = isLoadingMore ? [...state] : [];
       if (isArray(action.payload?.runsMatchingFilter)) {
         // @ts-expect-error TS(2345): Argument of type 'any' is not assignable to parame... Remove this comment to see the full error message
-        newState.push(...action.payload.runsMatchingFilter.map(({ info }: any) => info.run_uuid));
+        newState.push(...action.payload.runsMatchingFilter.map(({ info }: any) => info.runUuid));
       }
       return newState;
     }
@@ -127,12 +114,12 @@ export const runDatasetsByUuid = (state = {}, action: any) => {
   switch (action.type) {
     case fulfilled(GET_RUN_API): {
       const { run } = action.payload;
-      const runUuid = run.info.run_uuid;
+      const runUuid = run.info.runUuid;
       const runInputInfo = run.inputs || [];
       const newState = { ...state };
       if (runInputInfo && runUuid) {
         // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-        newState[runUuid] = runInputInfo.dataset_inputs;
+        newState[runUuid] = runInputInfo.datasetInputs;
       }
       return newState;
     }
@@ -145,10 +132,10 @@ export const runDatasetsByUuid = (state = {}, action: any) => {
             return;
           }
           const runInputInfo = runJson.inputs;
-          const runUuid = runJson.info.run_uuid;
+          const runUuid = runJson.info.runUuid;
           if (runInputInfo && runUuid) {
             // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-            newState[runUuid] = runInputInfo.dataset_inputs;
+            newState[runUuid] = runInputInfo.datasetInputs;
           }
         });
       }
@@ -162,16 +149,16 @@ export const runDatasetsByUuid = (state = {}, action: any) => {
 export const runInfosByUuid = (state = {}, action: any) => {
   switch (action.type) {
     case fulfilled(GET_RUN_API): {
-      const runInfo = (RunInfo as any).fromJs(action.payload.run.info);
+      const runInfo: RunInfoEntity = action.payload.run.info;
       return amendRunInfosByUuid(state, runInfo);
     }
     case fulfilled(SEARCH_RUNS_API): {
       const newState = {};
       if (action.payload && action.payload.runs) {
         action.payload.runs.forEach((rJson: any) => {
-          const runInfo = (RunInfo as any).fromJs(rJson.info);
+          const runInfo: RunInfoEntity = rJson.info;
           // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-          newState[runInfo.getRunUuid()] = runInfo;
+          newState[runInfo.runUuid] = runInfo;
         });
       }
       return newState;
@@ -183,9 +170,9 @@ export const runInfosByUuid = (state = {}, action: any) => {
       const newState = { ...state };
       if (action.payload && action.payload.runs) {
         action.payload.runs.forEach((rJson: any) => {
-          const runInfo = (RunInfo as any).fromJs(rJson.info);
+          const runInfo: RunInfoEntity = rJson.info;
           // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-          newState[runInfo.getRunUuid()] = runInfo;
+          newState[runInfo.runUuid] = runInfo;
         });
       }
       return newState;
@@ -195,10 +182,44 @@ export const runInfosByUuid = (state = {}, action: any) => {
   }
 };
 
+export const runInfoOrderByUuid = (state: string[] = [], action: any) => {
+  switch (action.type) {
+    case fulfilled(SEARCH_RUNS_API): {
+      const newState: Set<string> = new Set();
+      if (action.payload && action.payload.runs) {
+        action.payload.runs.forEach((rJson: any) => {
+          const runInfo: RunInfoEntity = rJson.info;
+          newState.add(runInfo.runUuid);
+        });
+      }
+      const newStateArray = Array.from(newState);
+      if (isEqual(state, newStateArray)) {
+        return state;
+      }
+      return newStateArray;
+    }
+    case fulfilled(LOAD_MORE_RUNS_API): {
+      const newState: Set<string> = new Set(state);
+      if (action.payload && action.payload.runs) {
+        action.payload.runs.forEach((rJson: any) => {
+          const runInfo: RunInfoEntity = rJson.info;
+          newState.add(runInfo.runUuid);
+        });
+      }
+      return Array.from(newState);
+    }
+    case rejected(SEARCH_RUNS_API): {
+      return [];
+    }
+    default:
+      return state;
+  }
+};
+
 export const modelVersionsByRunUuid = (state = {}, action: any) => {
   switch (action.type) {
     case fulfilled(SEARCH_MODEL_VERSIONS): {
-      let newState: Record<string, ModelVersionInfoEntity[]> = { ...state };
+      let newState = { ...state } satisfies Record<string, ModelVersionInfoEntity[]>;
       const updatedState: Record<string, ModelVersionInfoEntity[]> = {};
       if (action.payload) {
         const modelVersions: ModelVersionInfoEntity[] = action.payload[getProtoField('model_versions')];
@@ -213,7 +234,7 @@ export const modelVersionsByRunUuid = (state = {}, action: any) => {
         }
       }
       newState = { ...newState, ...updatedState };
-      if (_.isEqual(state, newState)) {
+      if (isEqual(state, newState)) {
         return state;
       }
       return newState;
@@ -226,7 +247,7 @@ export const modelVersionsByRunUuid = (state = {}, action: any) => {
 const amendRunInfosByUuid = (state: any, runInfo: any) => {
   return {
     ...state,
-    [runInfo.getRunUuid()]: runInfo,
+    [runInfo.runUuid]: runInfo,
   };
 };
 
@@ -249,7 +270,7 @@ export const paramsByRunUuid = (state = {}, action: any) => {
   switch (action.type) {
     case fulfilled(GET_RUN_API): {
       const { run } = action.payload;
-      const runUuid = run.info.run_uuid;
+      const runUuid = run.info.runUuid;
       const params = run.data.params || [];
       const newState = { ...state };
       // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
@@ -262,7 +283,7 @@ export const paramsByRunUuid = (state = {}, action: any) => {
       const newState = { ...state };
       if (runs) {
         runs.forEach((rJson: any) => {
-          const runUuid = rJson.info.run_uuid;
+          const runUuid = rJson.info.runUuid;
           const params = rJson.data.params || [];
           // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
           newState[runUuid] = paramArrToObject(params);
@@ -291,9 +312,9 @@ export const tagsByRunUuid = (state = {}, action: any) => {
   };
   switch (action.type) {
     case fulfilled(GET_RUN_API): {
-      const runInfo = (RunInfo as any).fromJs(action.payload.run.info);
+      const runInfo: RunInfoEntity = action.payload.run.info;
       const tags = action.payload.run.data.tags || [];
-      const runUuid = runInfo.getRunUuid();
+      const runUuid = runInfo.runUuid;
       const newState = { ...state };
       // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
       newState[runUuid] = tagArrToObject(tags);
@@ -305,7 +326,7 @@ export const tagsByRunUuid = (state = {}, action: any) => {
       const newState = { ...state };
       if (runs) {
         runs.forEach((rJson: any) => {
-          const runUuid = rJson.info.run_uuid;
+          const runUuid = rJson.info.runUuid;
           const tags = rJson.data.tags || [];
           // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
           newState[runUuid] = tagArrToObject(tags);
@@ -321,9 +342,9 @@ export const tagsByRunUuid = (state = {}, action: any) => {
       const { runUuid } = action.meta;
       // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
       const oldTags = state[runUuid] ? state[runUuid] : {};
-      const newTags = _.omit(oldTags, action.meta.key);
+      const newTags = omit(oldTags, action.meta.key);
       if (Object.keys(newTags).length === 0) {
-        return _.omit({ ...state }, runUuid);
+        return omit({ ...state }, runUuid);
       } else {
         return { ...state, [runUuid]: newTags };
       }
@@ -343,7 +364,7 @@ const amendTagsByRunUuid = (state: any, tags: any, runUuid: any) => {
         ...newState,
         [runUuid]: {
           ...oldTags,
-          [tag.getKey()]: tag,
+          [tag.key]: tag,
         },
       };
     });
@@ -364,12 +385,22 @@ export const experimentTagsByExperimentId = (state = {}, action: any) => {
       const newState = { ...state };
       const tags = experiment.tags || [];
       // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-      newState[experiment.experiment_id] = tagArrToObject(tags);
+      newState[experiment.experimentId] = tagArrToObject(tags);
       return newState;
     }
     case fulfilled(SET_EXPERIMENT_TAG_API): {
       const tag = { key: action.meta.key, value: action.meta.value };
       return amendExperimentTagsByExperimentId(state, [tag], action.meta.experimentId);
+    }
+    case fulfilled(DELETE_EXPERIMENT_TAG_API): {
+      const { experimentId } = action.meta;
+      // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
+      const oldTags = state[experimentId] ? state[experimentId] : {};
+      const newTags = omit(oldTags, action.meta.key);
+      if (Object.keys(newTags).length === 0) {
+        return omit({ ...state }, experimentId);
+      }
+      return { ...state, [experimentId]: newTags };
     }
     default:
       return state;
@@ -386,7 +417,7 @@ const amendExperimentTagsByExperimentId = (state: any, tags: any, expId: any) =>
         ...newState,
         [expId]: {
           ...oldTags,
-          [tag.getKey()]: tag,
+          [tag.key]: tag,
         },
       };
     });
@@ -400,11 +431,16 @@ export const getArtifacts = (runUuid: any, state: any) => {
 
 export const artifactsByRunUuid = (state = {}, action: any) => {
   switch (action.type) {
+    case fulfilled(LIST_ARTIFACTS_LOGGED_MODEL_API):
     case fulfilled(LIST_ARTIFACTS_API): {
       const queryPath = action.meta.path;
-      const { runUuid } = action.meta;
+      const { runUuid, loggedModelId } = action.meta;
+
+      // If the artifact belongs to a logged model instead of run, use its id as a store identifier
+      const storeIdentifier = loggedModelId ?? runUuid;
+
       // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
-      let artifactNode = state[runUuid] || new ArtifactNode(true);
+      let artifactNode = state[storeIdentifier] || new ArtifactNode(true);
       // Make deep copy.
       artifactNode = artifactNode.deepCopy();
       const { files } = action.payload;
@@ -412,7 +448,7 @@ export const artifactsByRunUuid = (state = {}, action: any) => {
       if (files === undefined) {
         return {
           ...state,
-          [runUuid]: artifactNode,
+          [storeIdentifier]: artifactNode,
         };
       }
       // Sort files to list directories first in the artifact tree view.
@@ -443,7 +479,7 @@ export const artifactsByRunUuid = (state = {}, action: any) => {
       }
       return {
         ...state,
-        [runUuid]: artifactNode,
+        [storeIdentifier]: artifactNode,
       };
     }
     default:
@@ -458,11 +494,11 @@ export const getArtifactRootUri = (runUuid: any, state: any) => {
 export const artifactRootUriByRunUuid = (state = {}, action: any) => {
   switch (action.type) {
     case fulfilled(GET_RUN_API): {
-      const runInfo = (RunInfo as any).fromJs(action.payload.run.info);
-      const runUuid = runInfo.getRunUuid();
+      const runInfo: RunInfoEntity = action.payload.run.info;
+      const runUuid = runInfo.runUuid;
       return {
         ...state,
-        [runUuid]: runInfo.getArtifactUri(),
+        [runUuid]: runInfo.artifactUri,
       };
     }
     case fulfilled(SEARCH_RUNS_API):
@@ -471,9 +507,9 @@ export const artifactRootUriByRunUuid = (state = {}, action: any) => {
       const newState: any = { ...state };
       if (runs) {
         runs.forEach((rJson: any) => {
-          const runUuid = rJson.info.run_uuid;
+          const runUuid = rJson.info.runUuid;
           const tags = rJson.data.tags || [];
-          newState[runUuid] = rJson.info.artifact_uri;
+          newState[runUuid] = rJson.info.artifactUri;
         });
       }
       return newState;
@@ -483,8 +519,8 @@ export const artifactRootUriByRunUuid = (state = {}, action: any) => {
   }
 };
 
-export const getExperimentDatasets = (experiment_id: string, state: any) => {
-  return state.entities.datasetsByExperimentId[experiment_id];
+const getExperimentDatasets = (experimentId: string, state: any) => {
+  return state.entities.datasetsByExperimentId[experimentId];
 };
 
 export const datasetsByExperimentId = (state = {}, action: any) => {
@@ -507,12 +543,15 @@ export const datasetsByExperimentId = (state = {}, action: any) => {
   }
 };
 
-export const entities = combineReducers({
+const entities = combineReducers({
   experimentsById,
   runInfosByUuid,
+  runInfoOrderByUuid,
   runDatasetsByUuid,
+  runInputsOutputsByUuid,
   runUuidsMatchingFilter,
   metricsByRunUuid,
+  imagesByRunUuid,
   latestMetricsByRunUuid,
   minMetricsByRunUuid,
   maxMetricsByRunUuid,
@@ -524,20 +563,21 @@ export const entities = combineReducers({
   modelVersionsByRunUuid,
   datasetsByExperimentId,
   sampledMetricsByRunUuid,
+  colorByRunUuid,
   ...modelRegistryReducers,
 });
 
 export const getSharedParamKeysByRunUuids = (runUuids: any, state: any) =>
-  _.intersection(...runUuids.map((runUuid: any) => Object.keys(state.entities.paramsByRunUuid[runUuid])));
+  intersection(...runUuids.map((runUuid: any) => Object.keys(state.entities.paramsByRunUuid[runUuid])));
 
 export const getSharedMetricKeysByRunUuids = (runUuids: any, state: any) =>
-  _.intersection(...runUuids.map((runUuid: any) => Object.keys(state.entities.latestMetricsByRunUuid[runUuid])));
+  intersection(...runUuids.map((runUuid: any) => Object.keys(state.entities.latestMetricsByRunUuid[runUuid])));
 
 export const getAllParamKeysByRunUuids = (runUuids: any, state: any) =>
-  _.union(...runUuids.map((runUuid: any) => Object.keys(state.entities.paramsByRunUuid[runUuid])));
+  union(...runUuids.map((runUuid: any) => Object.keys(state.entities.paramsByRunUuid[runUuid])));
 
 export const getAllMetricKeysByRunUuids = (runUuids: any, state: any) =>
-  _.union(...runUuids.map((runUuid: any) => Object.keys(state.entities.latestMetricsByRunUuid[runUuid])));
+  union(...runUuids.map((runUuid: any) => Object.keys(state.entities.latestMetricsByRunUuid[runUuid])));
 
 export const getApis = (requestIds: any, state: any) => {
   return requestIds.map((id: any) => state.apis[id] || {});
@@ -585,7 +625,7 @@ const defaultCompareExperimentsState: ComparedExperimentsReducerReduxState = {
   // Should be set to false when the user navigates to `/experiments/<experiment_id>`
   hasComparedExperimentsBefore: false,
 };
-export const compareExperiments = (
+const compareExperiments = (
   state: ComparedExperimentsReducerReduxState = defaultCompareExperimentsState,
   action: any,
 ): ComparedExperimentsReducerReduxState => {

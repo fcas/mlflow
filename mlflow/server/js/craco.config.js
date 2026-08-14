@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');
 const TsconfigPathsPlugin = require('tsconfig-paths-webpack-plugin');
 const webpack = require('webpack');
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+const MonacoWebpackPlugin = require('monaco-editor-webpack-plugin');
 
 const proxyTarget = process.env.MLFLOW_PROXY;
 const useProxyServer = !!proxyTarget && !process.env.MLFLOW_DEV_PROXY_MODE;
@@ -81,6 +83,61 @@ function configureIframeCSSPublicPaths(config, env) {
     throw new Error('Failed to fix CSS paths!');
   }
 
+  return config;
+}
+
+/**
+ * pdfjs-dist publishes browser-ready ESM (.mjs) bundles that do not need any
+ * further transformation. Two webpack defaults rewrite them anyway, both of
+ * which bake the build machine's filesystem path into the emitted assets and
+ * break the PDF artifact viewer at runtime:
+ *
+ *   1. CRA's babel-loader rule transforms .mjs files in node_modules.
+ *      @babel/plugin-transform-runtime injects helper imports, and inside the
+ *      webpack worker child compilation those resolve to fully-qualified
+ *      paths instead of module specifiers.
+ *      → Skip babel-loader for pdfjs-dist.
+ *
+ *   2. pdfjs uses `import.meta.url` inside Node-only code paths
+ *      (NodeCanvasFactory). Webpack's default is to substitute it with the
+ *      source file's absolute `file://` URL, which leaks the build machine
+ *      path. The previous fix set `parser.javascript.importMeta = false`,
+ *      but that switch tells webpack to leave the token alone, shipping a
+ *      literal `import.meta.url` into a classic-script chunk and triggering
+ *      `SyntaxError: Cannot use 'import.meta' outside a module` in the
+ *      browser (mlflow/mlflow#23720).
+ *      → Strip `import.meta.url` to `""` before webpack parses the file.
+ */
+function preservePdfjsBundles(config) {
+  const pdfjsPattern = /[\\/]node_modules[\\/]pdfjs-dist[\\/]/;
+  const isBabelLoaderRule = (r) => {
+    if (typeof r.loader === 'string' && r.loader.includes('babel-loader')) {
+      return true;
+    }
+    if (Array.isArray(r.use) && r.use.some((u) => typeof u?.loader === 'string' && u.loader.includes('babel-loader'))) {
+      return true;
+    }
+    return false;
+  };
+  let touched = false;
+  config.module.rules.forEach((rule) => {
+    if (!Array.isArray(rule.oneOf)) return;
+    rule.oneOf.forEach((r) => {
+      if (isBabelLoaderRule(r)) {
+        const exclude = Array.isArray(r.exclude) ? r.exclude : r.exclude ? [r.exclude] : [];
+        r.exclude = [...exclude, pdfjsPattern];
+        touched = true;
+      }
+    });
+  });
+  if (!touched) {
+    throw new Error('Failed to exclude pdfjs-dist from babel-loader: no rule matched');
+  }
+  config.module.rules.push({
+    test: pdfjsPattern,
+    enforce: 'pre',
+    use: [require.resolve('./PdfjsStripImportMetaLoader')],
+  });
   return config;
 }
 
@@ -209,7 +266,7 @@ module.exports = function () {
           },
         ],
         host: 'localhost',
-        port: 3000,
+        port: process.env.PORT || 3000,
         open: false,
       }),
       client: {
@@ -250,7 +307,6 @@ module.exports = function () {
           const validNodeModulesRoots = ['mlflow/web/js'];
 
           // prettier-ignore
-          // eslint-disable-next-line max-len
           return `(${validNodeModulesRoots.join('|')})\\/node_modules\\/((?!(${transpileModules.join('|')})).)+(js|jsx|mjs|cjs|ts|tsx|json)$`;
         };
 
@@ -260,6 +316,8 @@ module.exports = function () {
         jestConfig.setupFiles = ['jest-canvas-mock'];
         jestConfig.setupFilesAfterEnv.push('<rootDir>/scripts/env-mocks.js');
         jestConfig.setupFilesAfterEnv.push('<rootDir>/scripts/setup-jest-dom-matchers.js');
+        jestConfig.setupFilesAfterEnv.push('<rootDir>/scripts/setup-testing-library.js');
+        jestConfig.setupFilesAfterEnv.push('<rootDir>/src/setupTests.js');
         // Adjust config to work with dependencies using ".mjs" file extensions
         jestConfig.moduleFileExtensions.push('mjs');
         // Remove when this issue is resolved: https://github.com/gsoft-inc/craco/issues/393
@@ -272,14 +330,28 @@ module.exports = function () {
 
         const moduleNameMapper = {
           ...jestConfig.moduleNameMapper,
+          // bugfix for ESM issue in remark, see: https://github.com/orgs/remarkjs/discussions/1247
+          'unist-util-visit-parents/do-not-use-color': '<rootDir>/node_modules/unist-util-visit-parents/lib/color.js',
+          'vfile/do-not-use-conditional-minpath': '<rootDir>/node_modules/vfile/lib/minpath.browser.js',
+          'vfile/do-not-use-conditional-minproc': '<rootDir>/node_modules/vfile/lib/minproc.browser.js',
+          'vfile/do-not-use-conditional-minurl': '<rootDir>/node_modules/vfile/lib/minurl.browser.js',
+          // other aliases
+          '@databricks/i18n': '<rootDir>/src/i18n/i18n',
+          '@databricks/design-system/(.+)': '<rootDir>/node_modules/@databricks/design-system/dist/$1',
           '@databricks/web-shared/(.*)': '<rootDir>/src/shared/web-shared/$1',
+          '@mlflow/mlflow/(.*)': '<rootDir>/$1',
+          // mock files for recharts components
+          '^recharts$': '<rootDir>/__mocks__/recharts.tsx',
+          // Jest 27's resolver doesn't understand package.json "exports" subpath
+          // maps, so @a2ui's "./v0_9"-style subpaths (which have no top-level
+          // "main"/"module" entry) can't be found without an explicit alias.
+          '^@a2ui/web_core/v0_9/basic_catalog$':
+            '<rootDir>/node_modules/@a2ui/web_core/src/v0_9/basic_catalog/index.js',
+          '^@a2ui/web_core/v0_9$': '<rootDir>/node_modules/@a2ui/web_core/src/v0_9/index.js',
+          '^@a2ui/react/v0_9$': '<rootDir>/node_modules/@a2ui/react/v0_9/index.cjs',
         };
 
         jestConfig.moduleNameMapper = moduleNameMapper;
-        jestConfig.setupFilesAfterEnv = [
-          '<rootDir>/scripts/jest/react-versions/index.ts',
-          ...(jestConfig.setupFilesAfterEnv || []),
-        ];
 
         return jestConfig;
       },
@@ -287,12 +359,30 @@ module.exports = function () {
     webpack: {
       configure: (webpackConfig, { env }) => {
         webpackConfig.output.publicPath = 'static-files/';
+        // monaco-editor ships vendored CSS (e.g. the hover widget's hover.css) that uses
+        // `justify-content: end`, which autoprefixer flags as "end value has mixed support".
+        // It is third-party CSS we cannot edit, and CRA's production build treats webpack
+        // warnings as errors under CI. Scope the suppression to monaco-editor so the same
+        // warning still surfaces for our own CSS.
+        webpackConfig.ignoreWarnings = [
+          ...(webpackConfig.ignoreWarnings || []),
+          (warning) => {
+            const message = warning?.message ?? '';
+            const resource = warning?.module?.resource ?? '';
+            return /autoprefixer:.*mixed support/.test(message) && resource.includes('monaco-editor');
+          },
+        ];
         webpackConfig = i18nOverrides(webpackConfig);
         webpackConfig = configureIframeCSSPublicPaths(webpackConfig, env);
         webpackConfig = enableOptionalTypescript(webpackConfig);
+        webpackConfig = preservePdfjsBundles(webpackConfig);
         webpackConfig.resolve = {
           ...webpackConfig.resolve,
           plugins: [new TsconfigPathsPlugin(), ...webpackConfig.resolve.plugins],
+          fallback: {
+            // Required by 'plotly.js' download image feature
+            stream: require.resolve('stream-browserify'),
+          },
           alias: {
             ...webpackConfig.resolve.alias,
             // Fix integration with react 18 and react-dnd@15
@@ -301,16 +391,115 @@ module.exports = function () {
             'react/jsx-dev-runtime.js': require.resolve('react/jsx-dev-runtime'),
           },
         };
+
+        // Add separate entry for notebook renderer
+        webpackConfig.entry = {
+          main: webpackConfig.entry,
+          'ml-model-trace-renderer': path.resolve(
+            __dirname,
+            'src/shared/web-shared/model-trace-explorer/oss-notebook-renderer/index.ts',
+          ),
+          'telemetry-worker': path.resolve(__dirname, 'src/telemetry/worker/TelemetryLogger.worker.ts'),
+        };
+
+        // Configure output for multiple entries
+        webpackConfig.output = {
+          ...webpackConfig.output,
+          filename: (pathData) => {
+            if (pathData.chunk.name === 'telemetry-worker') {
+              // serve SharedWorker file at top-level, it seems to be more
+              // stable than if it's contained in `static/js/...`. previously
+              // i was running into issues with webpack path resolution
+              return 'TelemetryLogger.[name].[contenthash].worker.js';
+            }
+            return pathData.chunk.name === 'ml-model-trace-renderer'
+              ? 'lib/notebook-trace-renderer/js/[name].[contenthash].js'
+              : 'static/js/[name].[contenthash:8].js';
+          },
+          chunkFilename: (pathData) => {
+            if (pathData.chunk.name === 'telemetry-worker') {
+              return 'TelemetryLogger.[name].[contenthash].worker.chunk.js';
+            }
+            return pathData.chunk.name?.includes('ml-model-trace-renderer')
+              ? 'lib/notebook-trace-renderer/js/[name].[contenthash].chunk.js'
+              : 'static/js/[name].[contenthash:8].chunk.js';
+          },
+        };
+
+        // Configure CSS extraction for notebook renderer
+        if (env === 'production') {
+          const MiniCssExtractPlugin = webpackConfig.plugins.find(
+            (plugin) => plugin.constructor.name === 'MiniCssExtractPlugin',
+          );
+
+          if (MiniCssExtractPlugin) {
+            MiniCssExtractPlugin.options = {
+              ...MiniCssExtractPlugin.options,
+              filename: (pathData) => {
+                return pathData.chunk.name === 'ml-model-trace-renderer'
+                  ? 'lib/notebook-trace-renderer/css/[name].[contenthash].css'
+                  : 'static/css/[name].[contenthash:8].css';
+              },
+              chunkFilename: (pathData) => {
+                return pathData.chunk.name?.includes('ml-model-trace-renderer')
+                  ? 'lib/notebook-trace-renderer/css/[name].[contenthash].chunk.css'
+                  : 'static/css/[name].[contenthash:8].chunk.css';
+              },
+            };
+          }
+        }
+
+        // Configure main HtmlWebpackPlugin to exclude notebook renderer chunks
+        const mainHtmlPlugin = webpackConfig.plugins.find((plugin) => plugin.constructor.name === 'HtmlWebpackPlugin');
+        if (mainHtmlPlugin) {
+          mainHtmlPlugin.options.excludeChunks = ['ml-model-trace-renderer', 'telemetry-worker'];
+        }
+
+        // Add HTML template for notebook renderer
+        webpackConfig.plugins.push(
+          new HtmlWebpackPlugin({
+            template: path.resolve(
+              __dirname,
+              'src/shared/web-shared/model-trace-explorer/oss-notebook-renderer/index.html',
+            ),
+            filename: 'lib/notebook-trace-renderer/index.html',
+            chunks: ['ml-model-trace-renderer'],
+            inject: true,
+            publicPath: '/static-files/',
+            minify:
+              env === 'production'
+                ? {
+                    removeComments: true,
+                    collapseWhitespace: true,
+                    removeRedundantAttributes: true,
+                    useShortDoctype: true,
+                    removeEmptyAttributes: true,
+                    removeStyleLinkTypeAttributes: true,
+                    keepClosingSlash: true,
+                    minifyJS: true,
+                    minifyCSS: true,
+                    minifyURLs: true,
+                  }
+                : false,
+            base: '/',
+          }),
+        );
+
         console.log('Webpack config:', webpackConfig);
         return webpackConfig;
       },
       plugins: [
         new webpack.EnvironmentPlugin({
-          HIDE_HEADER: process.env.HIDE_HEADER ? 'true' : 'false',
-          HIDE_EXPERIMENT_LIST: process.env.HIDE_EXPERIMENT_LIST ? 'true' : 'false',
-          SHOW_GDPR_PURGING_MESSAGES: process.env.SHOW_GDPR_PURGING_MESSAGES ? 'true' : 'false',
-          USE_ABSOLUTE_AJAX_URLS: process.env.USE_ABSOLUTE_AJAX_URLS ? 'true' : 'false',
-          SHOULD_REDIRECT_IFRAME: process.env.SHOULD_REDIRECT_IFRAME ? 'true' : 'false',
+          MLFLOW_SHOW_GDPR_PURGING_MESSAGES: process.env.MLFLOW_SHOW_GDPR_PURGING_MESSAGES ? 'true' : 'false',
+          MLFLOW_USE_ABSOLUTE_AJAX_URLS: process.env.MLFLOW_USE_ABSOLUTE_AJAX_URLS ? 'true' : 'false',
+        }),
+        // Only the dataset record editor uses Monaco today, and only for JSON. Restricting
+        // languages + dropping the search/quickCommand features keeps the lazy chunk to ~1MB
+        // gz instead of the full ~3MB.
+        new MonacoWebpackPlugin({
+          languages: ['json'],
+          features: ['!gotoSymbol', '!documentSymbols'],
+          filename: 'static/js/monaco-[name].worker.[contenthash:8].js',
         }),
       ],
     },

@@ -1,29 +1,58 @@
-import json
 import logging
-from datetime import datetime
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Sequence
 
 from cachetools import TTLCache
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter
 
-from mlflow.entities.span import LiveSpan
+from mlflow.entities.model_registry import PromptVersion
+from mlflow.entities.trace import Trace
 from mlflow.environment_variables import (
+    MLFLOW_EXPERIMENT_ID,
     MLFLOW_TRACE_BUFFER_MAX_SIZE,
     MLFLOW_TRACE_BUFFER_TTL_SECONDS,
 )
-from mlflow.tracing.constant import TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION_KEY
+from mlflow.tracing.client import TracingClient
+from mlflow.tracing.export.async_export_queue import AsyncTraceExportQueue, Task
+from mlflow.tracing.export.utils import try_link_prompts_to_trace
+from mlflow.tracing.fluent import _set_last_active_trace_id
 from mlflow.tracing.trace_manager import InMemoryTraceManager
+from mlflow.tracing.utils import add_size_stats_to_trace_metadata
 
 _logger = logging.getLogger(__name__)
 
 
-def pop_trace(request_id: str) -> Optional[Dict[str, Any]]:
+def pop_trace(request_id: str) -> dict[str, Any] | None:
     """
     Pop the completed trace data from the buffer. This method is used in
     the Databricks model serving so please be careful when modifying it.
     """
+    if request_id not in _TRACE_BUFFER:
+        _logger.debug(
+            f"Request ID {request_id} not found in TRACE_BUFFER, "
+            f"available request IDs: {_TRACE_BUFFER.keys()}"
+        )
     return _TRACE_BUFFER.pop(request_id, None)
+
+
+def maybe_add_trace_to_serving_buffer(trace: "Trace") -> None:
+    """Store a finished trace in the serving buffer so Model Serving can return it in the response.
+
+    The scoring server reads the completed trace from ``_TRACE_BUFFER`` (keyed by client request
+    ID) after ``predict()`` returns. Exporters that write spans elsewhere than the inference table
+    (e.g. the UC table exporter) call this so the endpoint can still return the trace. The buffer
+    is in-memory, so this does not duplicate the exporter's own span/trace export.
+
+    No-op outside model serving, or when the trace has no client request ID to key on.
+    """
+    from mlflow.utils.databricks_utils import is_in_databricks_model_serving_environment
+
+    if not is_in_databricks_model_serving_environment():
+        return
+    if not (client_request_id := trace.info.client_request_id):
+        return
+    _TRACE_BUFFER[client_request_id] = trace.to_dict()
+    _logger.debug(f"Added {client_request_id} to TRACE_BUFFER")
 
 
 # For Inference Table, we use special TTLCache to store the finished traces
@@ -52,55 +81,82 @@ class InferenceTableSpanExporter(SpanExporter):
 
     def __init__(self):
         self._trace_manager = InMemoryTraceManager.get_instance()
+        if MLFLOW_EXPERIMENT_ID.get():
+            self._client = TracingClient("databricks")
+            self._async_queue = AsyncTraceExportQueue()
 
-    def export(self, root_spans: Sequence[ReadableSpan]):
+    def export(self, spans: Sequence[ReadableSpan]):
         """
-        Export the spans to MLflow backend.
+        Export the spans to Inference Table via the TTLCache buffer.
 
         Args:
-            spans: A sequence of OpenTelemetry ReadableSpan objects to be exported.
-                Only root spans for each trace are passed to this method.
+            spans: A sequence of OpenTelemetry ReadableSpan objects passed from
+                a span processor. Only root spans for each trace should be exported.
         """
-        for span in root_spans:
+        for span in spans:
             if span._parent is not None:
                 _logger.debug("Received a non-root span. Skipping export.")
                 continue
 
-            trace = self._trace_manager.pop_trace(span.context.trace_id)
-            if trace is None:
+            manager_trace = self._trace_manager.pop_trace(span.context.trace_id)
+            if manager_trace is None:
                 _logger.debug(f"Trace for span {span} not found. Skipping export.")
                 continue
 
+            if manager_trace.is_remote_trace:
+                _logger.warning(
+                    f"Mlflow does not support exporting the span {span.name} that is created "
+                    "in a remote process to Databricks InferenceTable."
+                )
+                continue
+
+            trace = manager_trace.trace
+            _set_last_active_trace_id(trace.info.trace_id)
+
             # Add the trace to the in-memory buffer so it can be retrieved by upstream
-            _TRACE_BUFFER[trace.info.request_id] = {
-                TRACE_SCHEMA_VERSION_KEY: TRACE_SCHEMA_VERSION,
-                "start_timestamp": self._nanoseconds_to_datetime(span._start_time),
-                "end_timestamp": self._nanoseconds_to_datetime(span._end_time),
-                "spans": [self._format_spans(span) for span in trace.data.spans],
-            }
+            # The key is Databricks request ID.
+            _TRACE_BUFFER[trace.info.client_request_id] = trace.to_dict()
+            _logger.debug(f"Added {trace.info.client_request_id} to TRACE_BUFFER")
 
-    def _format_spans(self, mlflow_span: LiveSpan) -> Dict[str, Any]:
-        """
-        Format the MLflow span to the format that can be stored in the Inference Table.
+            # Export to MLflow backend if experiment ID is set
+            if MLFLOW_EXPERIMENT_ID.get():
+                if trace.info.experiment_id is None:
+                    _logger.debug(
+                        f"{MLFLOW_EXPERIMENT_ID.name} is set, but trace {trace.info.trace_id} "
+                        "has no experiment ID. Skipping export."
+                    )
+                    continue
 
-        The schema is mostly the same, but the attributes field is stored as a JSON
-        string instead of a dictionary. Therefore, the attributes are converted from
-        Dict[str, str(json)] to str(json).
-        """
-        span_dict = mlflow_span.to_dict(dump_events=True)
-        attributes = span_dict["attributes"]
-        # deserialize each attribute value and then serialize the whole dictionary
-        attributes = {k: self._decode_attribute(v) for k, v in attributes.items()}
-        span_dict["attributes"] = json.dumps(attributes)
-        return span_dict
+                try:
+                    # Log the trace to the MLflow backend asynchronously
+                    self._async_queue.put(
+                        task=Task(
+                            handler=self._log_trace_to_mlflow_backend,
+                            args=(trace, manager_trace.prompts),
+                            error_msg=f"Failed to log trace {trace.info.trace_id}.",
+                        )
+                    )
+                except Exception as e:
+                    _logger.warning(
+                        f"Failed to export trace to MLflow backend. Error: {e}",
+                        stack_info=_logger.isEnabledFor(logging.DEBUG),
+                    )
 
-    def _decode_attribute(self, value: str) -> Any:
-        # All attribute values should be JSON encoded strings if they set via the MLflow Span
-        # property, but there may be some attributes set directly to the OpenTelemetry span.
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return value
+    def _log_trace_to_mlflow_backend(self, trace: Trace, prompts: Sequence[PromptVersion]):
+        add_size_stats_to_trace_metadata(trace)
 
-    def _nanoseconds_to_datetime(self, t: Optional[int]) -> Optional[datetime]:
-        return datetime.fromtimestamp(t / 1e9) if t is not None else None
+        returned_trace_info = self._client.start_trace(trace.info)
+        self._client._upload_trace_data(returned_trace_info, trace.data)
+
+        # Link prompt versions to the trace. Prompt linking is not critical for trace export
+        # (if the prompt fails to link, the user's workflow is minorly affected), so we handle
+        # errors gracefully without failing the entire trace export
+        try_link_prompts_to_trace(
+            client=self._client,
+            trace_id=returned_trace_info.trace_id,
+            prompts=prompts,
+            synchronous=True,  # Run synchronously since we're already in an async task
+        )
+        _logger.debug(
+            f"Finished logging trace to MLflow backend. TraceInfo: {returned_trace_info.to_dict()} "
+        )

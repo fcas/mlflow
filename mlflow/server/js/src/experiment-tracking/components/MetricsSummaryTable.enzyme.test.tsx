@@ -5,6 +5,7 @@
  * annotations are already looking good, please remove this comment.
  */
 
+import { describe, beforeEach, test, expect } from '@jest/globals';
 import React from 'react';
 import { Provider } from 'react-redux';
 import { MemoryRouter } from '../../common/utils/RoutingUtils';
@@ -13,8 +14,8 @@ import thunk from 'redux-thunk';
 import promiseMiddleware from 'redux-promise-middleware';
 import MetricsSummaryTable from './MetricsSummaryTable';
 import { HtmlTableView } from './HtmlTableView';
-import { Metric, RunInfo } from '../sdk/MlflowMessages';
-import { mountWithIntl } from 'common/utils/TestUtils.enzyme';
+import { Metric } from '../sdk/MlflowMessages';
+import { mountWithIntl } from '@mlflow/mlflow/src/common/utils/TestUtils.enzyme';
 
 describe('MetricsSummaryTable', () => {
   let wrapper;
@@ -24,8 +25,8 @@ describe('MetricsSummaryTable', () => {
   const minimalStoreRaw = {
     entities: {
       runInfosByUuid: {
-        'uuid-1234-5678-9012': (RunInfo as any).fromJs({ experiment_id: '1' }),
-        'uuid-1234-5678-9013': (RunInfo as any).fromJs({ experiment_id: '1' }),
+        'uuid-1234-5678-9012': { experimentId: '1' },
+        'uuid-1234-5678-9013': { experimentId: '1' },
       },
       latestMetricsByRunUuid: { 'uuid-1234-5678-9012': {} },
       minMetricsByRunUuid: { 'uuid-1234-5678-9012': {} },

@@ -14,7 +14,8 @@ import { getUUID } from '../../common/utils/ActionUtils';
 import { ModelRegistryRoutes } from '../routes';
 import { debounce } from 'lodash';
 import { modelNameValidator } from '../../common/forms/validations';
-import { IntlShape, injectIntl } from 'react-intl';
+import type { IntlShape } from 'react-intl';
+import { injectIntl } from 'react-intl';
 import { withRouterNext } from '../../common/utils/withRouterNext';
 import type { WithRouterNextProps } from '../../common/utils/withRouterNext';
 import { withErrorBoundary } from '../../common/utils/withErrorBoundary';
@@ -28,7 +29,7 @@ type Props = WithRouterNextProps & {
   intl: IntlShape;
 };
 
-export class CreateModelModalImpl extends React.Component<Props> {
+class CreateModelModalImpl extends React.Component<Props> {
   createRegisteredModelRequestId = getUUID();
 
   handleCreateRegisteredModel = async (values: any) => {
@@ -48,7 +49,7 @@ export class CreateModelModalImpl extends React.Component<Props> {
 
   handleOnCancel = () => {
     if (this.props.navigateBackOnCancel) {
-      this.props.navigate(-1);
+      this.props.navigate(ModelRegistryRoutes.modelListPageRoute);
     }
   };
 

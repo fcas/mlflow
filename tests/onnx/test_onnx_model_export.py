@@ -1,5 +1,5 @@
+import logging
 import os
-import sys
 from pathlib import Path
 from unittest import mock
 
@@ -40,11 +40,6 @@ from tests.helper_functions import (
 
 TEST_DIR = "tests"
 TEST_ONNX_RESOURCES_DIR = os.path.join(TEST_DIR, "resources", "onnx")
-
-pytestmark = pytest.mark.skipif(
-    (sys.version_info < (3, 6)), reason="Tests require Python 3 to run!"
-)
-
 EXTRA_PYFUNC_SERVING_TEST_ARGS = [] if _is_available_on_pypi("onnx") else ["--env-manager", "local"]
 
 
@@ -212,9 +207,10 @@ def onnx_model_multiple_inputs_float32():
 
 @pytest.fixture(scope="module")
 def data_multiple_inputs():
-    return pd.DataFrame(
-        {"first_input:0": np.random.random(10), "second_input:0": np.random.random(10)}
-    )
+    return pd.DataFrame({
+        "first_input:0": np.random.random(10),
+        "second_input:0": np.random.random(10),
+    })
 
 
 @pytest.fixture(scope="module")
@@ -262,7 +258,7 @@ def test_model_log_load(onnx_model, save_as_external_data):
 
     with mlflow.start_run():
         model_info = mlflow.onnx.log_model(
-            onnx_model, artifact_path="model", save_as_external_data=save_as_external_data
+            onnx_model, name="model", save_as_external_data=save_as_external_data
         )
 
     if save_as_external_data:
@@ -411,7 +407,7 @@ def test_model_save_load_evaluate_pyfunc_format_multiple_inputs(
 # is fixed.
 
 
-def test_pyfunc_representation_of_float32_model_casts_and_evalutes_float64_inputs(
+def test_pyfunc_representation_of_float32_model_casts_and_evaluates_float64_inputs(
     onnx_model_multiple_inputs_float32, model_path, data_multiple_inputs, predicted_multiple_inputs
 ):
     """
@@ -445,13 +441,11 @@ def test_model_log(onnx_model):
             if should_start_run:
                 mlflow.start_run()
             artifact_path = "onnx_model"
-            model_info = mlflow.onnx.log_model(onnx_model=onnx_model, artifact_path=artifact_path)
-            model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
-            assert model_info.model_uri == model_uri
+            model_info = mlflow.onnx.log_model(onnx_model, name=artifact_path)
 
             # Load model
             onnx.checker.check_model = mock.Mock()
-            mlflow.onnx.load_model(model_uri)
+            mlflow.onnx.load_model(model_info.model_uri)
             assert onnx.checker.check_model.called
         finally:
             mlflow.end_run()
@@ -461,16 +455,15 @@ def test_log_model_calls_register_model(onnx_model, onnx_custom_env):
     artifact_path = "model"
     register_model_patch = mock.patch("mlflow.tracking._model_registry.fluent._register_model")
     with mlflow.start_run(), register_model_patch:
-        mlflow.onnx.log_model(
-            onnx_model=onnx_model,
-            artifact_path=artifact_path,
+        model_info = mlflow.onnx.log_model(
+            onnx_model,
+            name=artifact_path,
             conda_env=onnx_custom_env,
             registered_model_name="AdsModel1",
         )
-        model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
         assert_register_model_called_with_local_model_path(
             register_model_mock=mlflow.tracking._model_registry.fluent._register_model,
-            model_uri=model_uri,
+            model_uri=model_info.model_uri,
             registered_model_name="AdsModel1",
         )
 
@@ -479,22 +472,19 @@ def test_log_model_no_registered_model_name(onnx_model, onnx_custom_env):
     artifact_path = "model"
     register_model_patch = mock.patch("mlflow.tracking._model_registry.fluent._register_model")
     with mlflow.start_run(), register_model_patch:
-        mlflow.onnx.log_model(
-            onnx_model=onnx_model, artifact_path=artifact_path, conda_env=onnx_custom_env
-        )
+        mlflow.onnx.log_model(onnx_model, name=artifact_path, conda_env=onnx_custom_env)
         mlflow.tracking._model_registry.fluent._register_model.assert_not_called()
 
 
 def test_model_log_evaluate_pyfunc_format(onnx_model, data, predicted):
     x = data[0]
 
-    with mlflow.start_run() as run:
+    with mlflow.start_run():
         artifact_path = "onnx_model"
-        mlflow.onnx.log_model(onnx_model=onnx_model, artifact_path=artifact_path)
-        model_uri = f"runs:/{run.info.run_id}/{artifact_path}"
+        model_info = mlflow.onnx.log_model(onnx_model, name=artifact_path)
 
         # Loading pyfunc model
-        pyfunc_loaded = mlflow.pyfunc.load_model(model_uri=model_uri)
+        pyfunc_loaded = mlflow.pyfunc.load_model(model_uri=model_info.model_uri)
         np.testing.assert_allclose(
             pyfunc_loaded.predict(x).values.flatten(), predicted, rtol=1e-05, atol=1e-05
         )
@@ -566,23 +556,25 @@ def test_log_model_with_pip_requirements(onnx_model, tmp_path):
     req_file = tmp_path.joinpath("requirements.txt")
     req_file.write_text("a")
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model, "model", pip_requirements=str(req_file))
-        _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"), [expected_mlflow_version, "a"], strict=True
-        )
+        model_info = mlflow.onnx.log_model(onnx_model, name="model", pip_requirements=str(req_file))
+        _assert_pip_requirements(model_info.model_uri, [expected_mlflow_version, "a"], strict=True)
 
     # List of requirements
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model, "model", pip_requirements=[f"-r {req_file}", "b"])
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name="model", pip_requirements=[f"-r {req_file}", "b"]
+        )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"), [expected_mlflow_version, "a", "b"], strict=True
+            model_info.model_uri, [expected_mlflow_version, "a", "b"], strict=True
         )
 
     # Constraints file
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model, "model", pip_requirements=[f"-c {req_file}", "b"])
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name="model", pip_requirements=[f"-c {req_file}", "b"]
+        )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"),
+            model_info.model_uri,
             [expected_mlflow_version, "b", "-c constraints.txt"],
             ["a"],
             strict=True,
@@ -597,23 +589,29 @@ def test_log_model_with_extra_pip_requirements(onnx_model, tmp_path):
     req_file = tmp_path.joinpath("requirements.txt")
     req_file.write_text("a")
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model, "model", extra_pip_requirements=str(req_file))
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name="model", extra_pip_requirements=str(req_file)
+        )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"), [expected_mlflow_version, *default_reqs, "a"]
+            model_info.model_uri, [expected_mlflow_version, *default_reqs, "a"]
         )
 
     # List of requirements
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model, "model", extra_pip_requirements=[f"-r {req_file}", "b"])
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name="model", extra_pip_requirements=[f"-r {req_file}", "b"]
+        )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"), [expected_mlflow_version, *default_reqs, "a", "b"]
+            model_info.model_uri, [expected_mlflow_version, *default_reqs, "a", "b"]
         )
 
     # Constraints file
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model, "model", extra_pip_requirements=[f"-c {req_file}", "b"])
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name="model", extra_pip_requirements=[f"-c {req_file}", "b"]
+        )
         _assert_pip_requirements(
-            mlflow.get_artifact_uri("model"),
+            model_info.model_uri,
             [expected_mlflow_version, *default_reqs, "b", "-c constraints.txt"],
             ["a"],
         )
@@ -638,12 +636,10 @@ def test_model_log_persists_specified_conda_env_in_mlflow_model_directory(
 ):
     artifact_path = "model"
     with mlflow.start_run():
-        mlflow.onnx.log_model(
-            onnx_model=onnx_model, artifact_path=artifact_path, conda_env=onnx_custom_env
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name=artifact_path, conda_env=onnx_custom_env
         )
-        model_path = _download_artifact_from_uri(
-            f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
-        )
+        model_path = _download_artifact_from_uri(model_info.model_uri)
 
     pyfunc_conf = _get_flavor_configuration(model_path=model_path, flavor_name=pyfunc.FLAVOR_NAME)
     saved_conda_env_path = os.path.join(model_path, pyfunc_conf[pyfunc.ENV]["conda"])
@@ -660,12 +656,10 @@ def test_model_log_persists_specified_conda_env_in_mlflow_model_directory(
 def test_model_log_persists_requirements_in_mlflow_model_directory(onnx_model, onnx_custom_env):
     artifact_path = "model"
     with mlflow.start_run():
-        mlflow.onnx.log_model(
-            onnx_model=onnx_model, artifact_path=artifact_path, conda_env=onnx_custom_env
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name=artifact_path, conda_env=onnx_custom_env
         )
-        model_path = _download_artifact_from_uri(
-            f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
-        )
+        model_path = _download_artifact_from_uri(model_info.model_uri)
 
     saved_pip_req_path = os.path.join(model_path, "requirements.txt")
     _compare_conda_env_requirements(onnx_custom_env, saved_pip_req_path)
@@ -683,9 +677,8 @@ def test_model_log_without_specified_conda_env_uses_default_env_with_expected_de
 ):
     artifact_path = "model"
     with mlflow.start_run():
-        mlflow.onnx.log_model(onnx_model=onnx_model, artifact_path=artifact_path)
-        model_uri = mlflow.get_artifact_uri(artifact_path)
-    _assert_pip_requirements(model_uri, mlflow.onnx.get_default_pip_requirements())
+        model_info = mlflow.onnx.log_model(onnx_model, name=artifact_path)
+    _assert_pip_requirements(model_info.model_uri, mlflow.onnx.get_default_pip_requirements())
 
 
 def test_pyfunc_predict_supports_models_with_list_outputs(onnx_sklearn_model, model_path, data):
@@ -703,13 +696,13 @@ def test_pyfunc_predict_supports_models_with_list_outputs(onnx_sklearn_model, mo
 
 def test_log_model_with_code_paths(onnx_model):
     artifact_path = "model"
-    with mlflow.start_run(), mock.patch(
-        "mlflow.onnx._add_code_from_conf_to_system_path"
-    ) as add_mock:
-        mlflow.onnx.log_model(onnx_model, artifact_path, code_paths=[__file__])
-        model_uri = mlflow.get_artifact_uri(artifact_path)
-        _compare_logged_code_paths(__file__, model_uri, mlflow.onnx.FLAVOR_NAME)
-        mlflow.onnx.load_model(model_uri)
+    with (
+        mlflow.start_run(),
+        mock.patch("mlflow.onnx._add_code_from_conf_to_system_path") as add_mock,
+    ):
+        model_info = mlflow.onnx.log_model(onnx_model, name=artifact_path, code_paths=[__file__])
+        _compare_logged_code_paths(__file__, model_info.model_uri, mlflow.onnx.FLAVOR_NAME)
+        mlflow.onnx.load_model(model_info.model_uri)
         add_mock.assert_called()
 
 
@@ -732,10 +725,221 @@ def test_model_log_with_metadata(onnx_model):
     artifact_path = "model"
 
     with mlflow.start_run():
-        mlflow.onnx.log_model(
-            onnx_model, artifact_path=artifact_path, metadata={"metadata_key": "metadata_value"}
+        model_info = mlflow.onnx.log_model(
+            onnx_model, name=artifact_path, metadata={"metadata_key": "metadata_value"}
         )
-        model_uri = mlflow.get_artifact_uri(artifact_path)
 
-    reloaded_model = mlflow.pyfunc.load_model(model_uri=model_uri)
+    reloaded_model = mlflow.pyfunc.load_model(model_uri=model_info.model_uri)
     assert reloaded_model.metadata.metadata["metadata_key"] == "metadata_value"
+
+
+def _stub_session(mock_session, active_providers=None, raise_on_providers=None):
+    # _OnnxModelWrapper.__init__ asserts len(self.rt.get_inputs()) >= 1, reads
+    # inp.name/inp.type and outp.name, and calls get_providers() to detect runtime
+    # fallback. Configure the mocked InferenceSession's return value so construction
+    # completes.
+    #   - active_providers: what the constructed session reports as actually activated;
+    #     default echoes the providers the (final) session was constructed with.
+    #   - raise_on_providers: if given, an InferenceSession(...) call whose providers equal
+    #     this list raises RuntimeError (simulating a provider that fails to initialize,
+    #     e.g. TensorRT without libnvinfer); other calls return the stub session.
+    inp = mock.Mock()
+    inp.name, inp.type = "input", "tensor(float)"
+    outp = mock.Mock()
+    outp.name = "output"
+    session = mock_session.return_value
+    session.get_inputs.return_value = [inp]
+    session.get_outputs.return_value = [outp]
+
+    def _construct(*args, **kwargs):
+        if raise_on_providers is not None and kwargs.get("providers") == raise_on_providers:
+            raise RuntimeError("simulated provider init failure (e.g. missing libnvinfer)")
+        return session
+
+    mock_session.side_effect = _construct
+
+    def _get_providers():
+        if active_providers is not None:
+            return active_providers
+        # Echo whatever providers the session was last constructed with.
+        _, kwargs = mock_session.call_args
+        return kwargs.get("providers") or ["CPUExecutionProvider"]
+
+    session.get_providers.side_effect = _get_providers
+
+
+def test_onnx_model_load_honors_declared_execution_providers(onnx_model, model_path):
+    mlflow.onnx.save_model(
+        onnx_model, model_path, onnx_execution_providers=["CPUExecutionProvider"]
+    )
+    with mock.patch("onnxruntime.InferenceSession") as mock_session:
+        _stub_session(mock_session)
+        mlflow.pyfunc.load_model(model_path)
+    _, kwargs = mock_session.call_args
+    assert kwargs["providers"] == ["CPUExecutionProvider"]
+
+
+def test_onnx_model_load_warns_when_declared_provider_unavailable(onnx_model, model_path, caplog):
+    mlflow.onnx.save_model(
+        onnx_model,
+        model_path,
+        onnx_execution_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    # The "mlflow" logger sets propagate=False, so caplog's root handler does not see
+    # records. Attach caplog's handler directly to the mlflow.onnx logger
+    # (mirrors tests/server/test_security.py:84-92).
+    onnx_logger = logging.getLogger("mlflow.onnx")
+    onnx_logger.addHandler(caplog.handler)
+    try:
+        with (
+            mock.patch("onnxruntime.InferenceSession") as mock_session,
+            mock.patch(
+                "onnxruntime.get_available_providers",
+                return_value=["CPUExecutionProvider"],
+            ),
+            caplog.at_level("WARNING", logger="mlflow.onnx"),
+        ):
+            _stub_session(mock_session)
+            mlflow.pyfunc.load_model(model_path)
+    finally:
+        onnx_logger.removeHandler(caplog.handler)
+    _, kwargs = mock_session.call_args
+    assert kwargs["providers"] == ["CPUExecutionProvider"]
+    assert "CUDAExecutionProvider" in caplog.text
+
+
+def test_onnx_model_load_coerces_string_provider_metadata(onnx_model, model_path):
+    # Malformed/legacy metadata may store a single provider as a bare string rather than a
+    # list. Without coercion the loader would iterate over its characters and silently fall
+    # back to CPU; the guard normalizes it to a one-element list.
+    mlflow.onnx.save_model(onnx_model, model_path, onnx_execution_providers="CUDAExecutionProvider")
+    with (
+        mock.patch("onnxruntime.InferenceSession") as mock_session,
+        mock.patch(
+            "onnxruntime.get_available_providers",
+            return_value=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        ),
+    ):
+        _stub_session(mock_session)
+        mlflow.pyfunc.load_model(model_path)
+    _, kwargs = mock_session.call_args
+    assert kwargs["providers"] == ["CUDAExecutionProvider"]
+
+
+def test_onnx_model_load_warns_on_runtime_provider_fallback(onnx_model, model_path, caplog):
+    # A requested provider can be compiled into onnxruntime (so it appears in
+    # get_available_providers()) yet fail to initialize at runtime -- e.g. a CUDA
+    # driver/runtime mismatch -- causing a silent fallback to CPU. The loader compares
+    # requested vs actually-activated providers and warns on the drop.
+    mlflow.onnx.save_model(
+        onnx_model,
+        model_path,
+        onnx_execution_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    onnx_logger = logging.getLogger("mlflow.onnx")
+    onnx_logger.addHandler(caplog.handler)
+    try:
+        with (
+            mock.patch("onnxruntime.InferenceSession") as mock_session,
+            mock.patch(
+                "onnxruntime.get_available_providers",
+                return_value=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            ),
+            caplog.at_level("WARNING", logger="mlflow.onnx"),
+        ):
+            # CUDA is "available" but the session activates CPU only (runtime init failed).
+            _stub_session(mock_session, active_providers=["CPUExecutionProvider"])
+            mlflow.pyfunc.load_model(model_path)
+    finally:
+        onnx_logger.removeHandler(caplog.handler)
+    _, kwargs = mock_session.call_args
+    # We still requested CUDA (it passed the available-providers filter)...
+    assert kwargs["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    # ...but the runtime-fallback warning fires because it was not activated, and since
+    # nothing accelerated survived the warning says inference runs on CPU.
+    assert "CUDAExecutionProvider" in caplog.text
+    assert "failed to initialize at runtime" in caplog.text
+    assert "Inference will run on CPU." in caplog.text
+
+
+def test_onnx_model_load_warns_but_keeps_gpu_when_only_some_providers_drop(
+    onnx_model, model_path, caplog
+):
+    # When onnxruntime drops one requested provider (e.g. TensorRT) but a GPU provider
+    # (CUDA) survives, the model still runs on GPU. The warning must report the drop
+    # without claiming acceleration was lost.
+    mlflow.onnx.save_model(
+        onnx_model,
+        model_path,
+        onnx_execution_providers=[
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+    )
+    onnx_logger = logging.getLogger("mlflow.onnx")
+    onnx_logger.addHandler(caplog.handler)
+    try:
+        with (
+            mock.patch("onnxruntime.InferenceSession") as mock_session,
+            mock.patch(
+                "onnxruntime.get_available_providers",
+                return_value=[
+                    "TensorrtExecutionProvider",
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
+                ],
+            ),
+            caplog.at_level("WARNING", logger="mlflow.onnx"),
+        ):
+            # TensorRT is dropped at runtime but CUDA survives -> still on GPU.
+            _stub_session(
+                mock_session,
+                active_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+            mlflow.pyfunc.load_model(model_path)
+    finally:
+        onnx_logger.removeHandler(caplog.handler)
+    assert "TensorrtExecutionProvider" in caplog.text
+    assert "failed to initialize at runtime" in caplog.text
+    # CUDA survived, so the message must NOT claim CPU-only.
+    assert "Inference will still use the remaining accelerated provider(s)." in caplog.text
+    assert "Inference will run on CPU." not in caplog.text
+
+
+def test_onnx_model_load_falls_back_to_cpu_when_provider_construction_raises(
+    onnx_model, model_path, caplog
+):
+    # Some providers raise during construction rather than silently dropping -- e.g.
+    # TensorRT without libnvinfer, or CUDA driver/runtime mismatch. The loader must not
+    # regress a previously-loadable model into a hard failure: it retries on CPU and warns.
+    mlflow.onnx.save_model(
+        onnx_model,
+        model_path,
+        onnx_execution_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    onnx_logger = logging.getLogger("mlflow.onnx")
+    onnx_logger.addHandler(caplog.handler)
+    try:
+        with (
+            mock.patch("onnxruntime.InferenceSession") as mock_session,
+            mock.patch(
+                "onnxruntime.get_available_providers",
+                return_value=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            ),
+            caplog.at_level("WARNING", logger="mlflow.onnx"),
+        ):
+            # Constructing with the GPU providers raises; the CPU-only retry succeeds.
+            _stub_session(
+                mock_session,
+                active_providers=["CPUExecutionProvider"],
+                raise_on_providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+            mlflow.pyfunc.load_model(model_path)
+    finally:
+        onnx_logger.removeHandler(caplog.handler)
+    # Two constructions: the failing GPU attempt, then the CPU fallback.
+    assert mock_session.call_count == 2
+    _, kwargs = mock_session.call_args
+    assert kwargs["providers"] == ["CPUExecutionProvider"]
+    assert "falling back to CPU" in caplog.text

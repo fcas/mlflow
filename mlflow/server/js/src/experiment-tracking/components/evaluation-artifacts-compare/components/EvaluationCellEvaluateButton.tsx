@@ -1,7 +1,7 @@
-import { Button, InfoIcon, PlayIcon, RefreshIcon, Tooltip } from '@databricks/design-system';
+import { Button, InfoSmallIcon, PlayIcon, RefreshIcon, Tooltip } from '@databricks/design-system';
 import { FormattedMessage } from 'react-intl';
 import { usePromptEngineeringContext } from '../contexts/PromptEngineeringContext';
-import { RunRowType } from '../../experiment-page/utils/experimentPage.row-types';
+import type { RunRowType } from '../../experiment-page/utils/experimentPage.row-types';
 import { canEvaluateOnRun } from '../../prompt-engineering/PromptEngineering.utils';
 
 /**
@@ -26,7 +26,9 @@ export const EvaluationCellEvaluateButton = ({
   if (missingParamsToEvaluate && missingParamsToEvaluate.length > 0) {
     return (
       <Tooltip
-        title={
+        componentId="mlflow.experiment-tracking.evaluation-cell.evaluate-all"
+        disableHoverableContent={false}
+        content={
           <FormattedMessage
             description="Experiment page > artifact compare view > text cell > missing evaluation parameter values tooltip"
             defaultMessage='Evaluation is not possible because values for the following inputs cannot be determined: {missingParamList}. Add input columns to the "group by" settings or use "Add row" button to define new parameter set.'
@@ -36,7 +38,9 @@ export const EvaluationCellEvaluateButton = ({
           />
         }
       >
-        <InfoIcon />
+        <span>
+          <InfoSmallIcon />
+        </span>
       </Tooltip>
     );
   }
@@ -44,14 +48,17 @@ export const EvaluationCellEvaluateButton = ({
   if (!isRunEvaluable) {
     return (
       <Tooltip
-        title={
+        componentId="mlflow.experiment-tracking.evaluation-cell.not-evaluable"
+        content={
           <FormattedMessage
             description="Experiment page > artifact compare view > text cell > run not evaluable tooltip"
             defaultMessage="You cannot evaluate this cell, this run was not created using served LLM model route"
           />
         }
       >
-        <InfoIcon />
+        <span>
+          <InfoSmallIcon />
+        </span>
       </Tooltip>
     );
   }

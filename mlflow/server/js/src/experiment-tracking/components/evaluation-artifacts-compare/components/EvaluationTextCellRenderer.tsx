@@ -1,14 +1,16 @@
 import { TableSkeleton, Typography, useDesignSystemTheme } from '@databricks/design-system';
+import { escapeRegExp } from 'lodash';
 import type { ICellRendererParams } from '@ag-grid-community/core';
 import { FormattedMessage } from 'react-intl';
 import React from 'react';
-import { RunRowType } from '../../experiment-page/utils/experimentPage.row-types';
+import type { RunRowType } from '../../experiment-page/utils/experimentPage.row-types';
 import { usePromptEngineeringContext } from '../contexts/PromptEngineeringContext';
 import { useSelector } from 'react-redux';
-import { ReduxState } from '../../../../redux-types';
+import type { ReduxState } from '../../../../redux-types';
 import { EvaluationCellEvaluateButton } from './EvaluationCellEvaluateButton';
 import { shouldEnablePromptLab } from '../../../../common/utils/FeatureUtils';
-import { UseEvaluationArtifactTableDataResult } from '../hooks/useEvaluationArtifactTableData';
+import type { UseEvaluationArtifactTableDataResult } from '../hooks/useEvaluationArtifactTableData';
+import { JsonPreview } from '../../../../common/components/JsonFormatting';
 
 // Truncate the text in the cell, it doesn't make sense to populate
 // more data into the DOM since cells have hidden overflow anyway
@@ -29,13 +31,14 @@ interface EvaluationTextCellRendererProps extends ICellRendererParams {
  * Internal use component - breaks down the rendered text into chunks and highlights
  * particular part found by the provided substring.
  */
+// eslint-disable-next-line react-component-name/react-component-name -- TODO(FEINF-4716)
 const HighlightedText = React.memo(({ text, highlight }: { text: string; highlight: string }) => {
   const { theme } = useDesignSystemTheme();
   if (!highlight) {
     return <>{text}</>;
   }
 
-  const parts = text.split(new RegExp(`(${highlight})`, 'gi'));
+  const parts = text.split(new RegExp(`(${escapeRegExp(highlight)})`, 'gi'));
 
   return (
     <>
@@ -55,7 +58,6 @@ const HighlightedText = React.memo(({ text, highlight }: { text: string; highlig
 /**
  * Component used to render a single text cell in the evaluation artifacts comparison table.
  */
-/* eslint-disable complexity */
 export const EvaluationTextCellRenderer = ({
   value,
   context,
@@ -78,6 +80,15 @@ export const EvaluationTextCellRenderer = ({
     outputMetadata?.isPending || data.isPendingInputRow
       ? theme.colors.backgroundSecondary
       : theme.colors.backgroundPrimary;
+
+  const structuredJSONValue = React.useMemo(() => {
+    try {
+      const objectData = JSON.parse(value);
+      return objectData;
+    } catch (e) {
+      return null;
+    }
+  }, [value]);
 
   return (
     <div
@@ -105,20 +116,29 @@ export const EvaluationTextCellRenderer = ({
                 description="Experiment page > artifact compare view > results table > no result (empty cell)"
               />
             </Typography.Text>
+          ) : structuredJSONValue ? (
+            <JsonPreview json={JSON.stringify(structuredJSONValue, null, 2)} />
           ) : (
             <span
               css={{
                 display: '-webkit-box',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
-                '-webkit-box-orient': 'vertical',
-                '-webkit-line-clamp': '7',
+                WebkitBoxOrient: 'vertical',
+                WebkitLineClamp: '7',
               }}
             >
               {isGroupByColumn && context.highlightedText ? (
                 <HighlightedText text={value} highlight={context.highlightedText} />
-              ) : (
+              ) : typeof value === 'string' ? (
                 value.substring(0, MAX_TEXT_LENGTH)
+              ) : (
+                /**
+                 * There is a transient state when this value is an object used
+                 * for EvaluationImageCellRenderer. This will prevent displaying
+                 * [object Object] in the cell and cause AgGrid errors.
+                 */
+                typeof value !== 'object' && value
               )}
             </span>
           )}

@@ -6,88 +6,110 @@
  */
 
 import React, { Component } from 'react';
-import { Modal } from '@databricks/design-system';
+import { Alert, Modal, Spacer } from '@databricks/design-system';
+import { FormattedMessage } from 'react-intl';
 
-import Utils from '../../../common/utils/Utils';
+import { ErrorWrapper } from '../../../common/utils/ErrorWrapper';
+import { ErrorCodes } from '../../../common/constants';
 
 type Props = {
   okText?: string;
   cancelText?: string;
   isOpen?: boolean;
   onClose: (...args: any[]) => any;
-  onCancel?: (...args: any[]) => any;
+  onCancel?: () => void;
   className?: string;
   footer?: React.ReactNode;
   handleSubmit: (...args: any[]) => any;
   title: React.ReactNode;
+  okButtonProps?: React.ComponentProps<typeof Modal>['okButtonProps'];
 };
 
-type State = any;
+type State = {
+  isSubmitting: boolean;
+  submissionError?: React.ReactNode;
+};
 
 /**
  * Generic modal that has a title and an input field with a save/submit button.
  * As of now, it is used to display the 'Rename Run' and 'Rename Experiment' modals.
  */
 export class GenericInputModal extends Component<Props, State> {
-  state = {
+  state: State = {
     isSubmitting: false,
+    submissionError: undefined,
   };
 
   formRef = React.createRef();
 
   onSubmit = async () => {
-    this.setState({ isSubmitting: true });
+    this.setState({ isSubmitting: true, submissionError: undefined });
     try {
       const values = await (this as any).formRef.current.validateFields();
-
-      // call handleSubmit from parent component, pass form values
-      // handleSubmit is expected to return a promise
-      return await this.props
-        .handleSubmit(values)
-        .then(this.resetAndClearModalForm)
-        .catch(this.handleSubmitFailure)
-        .finally(this.onRequestCloseHandler);
+      await this.props.handleSubmit(values);
+      this.resetAndClearModalForm();
+      this.onRequestCloseHandler();
     } catch (e) {
-      this.setState({ isSubmitting: false });
-      return Promise.reject(e);
+      this.handleSubmitFailure(e);
     }
   };
 
   resetAndClearModalForm = () => {
-    this.setState({ isSubmitting: false });
+    this.setState({ isSubmitting: false, submissionError: undefined });
     (this as any).formRef.current.resetFields();
   };
 
   handleSubmitFailure = (e: any) => {
-    this.setState({ isSubmitting: false });
-    Utils.logErrorAndNotifyUser(e);
+    // Form validation failures are already displayed inline on the fields
+    // themselves, so no modal-level error is needed for them
+    if (e?.errorFields) {
+      this.setState({ isSubmitting: false });
+      return;
+    }
+    // Keep submission failures in modal context (instead of a transient global
+    // toast) so the user can read the error and correct their input
+    let message;
+    if (typeof e === 'string') {
+      message = e;
+    } else if (e instanceof ErrorWrapper) {
+      // getMessageField() returns the parsed JSON `message`, but falls back to the
+      // generic INTERNAL_ERROR code when the response body is plain text or HTML.
+      // In that case renderHttpError() surfaces the actual server/proxy message.
+      const messageField = e.getMessageField();
+      message = messageField && messageField !== ErrorCodes.INTERNAL_ERROR ? messageField : e.renderHttpError();
+    } else {
+      message = e?.message;
+    }
+    this.setState({
+      isSubmitting: false,
+      submissionError: message || (
+        <FormattedMessage
+          defaultMessage="The request failed. Please try again."
+          description="Fallback error message shown inside an input modal when submission fails without details"
+        />
+      ),
+    });
   };
 
   onRequestCloseHandler = () => {
-    if (!this.state.isSubmitting) {
-      this.resetAndClearModalForm();
-      this.props.onClose();
-    }
+    this.resetAndClearModalForm();
+    this.props.onClose();
   };
 
   handleCancel = () => {
     this.onRequestCloseHandler();
-    // Check for optional `onCancel` method prop.
-    if (this.props.onCancel !== undefined) {
-      this.props.onCancel();
-    }
+    this.props.onCancel?.();
   };
 
   render() {
-    const { isSubmitting } = this.state;
-    const { okText, cancelText, isOpen, footer, children } = this.props;
+    const { isSubmitting, submissionError } = this.state;
+    const { okText, cancelText, isOpen, footer, children, okButtonProps } = this.props;
 
     // add props (ref) to passed component
     const displayForm = React.Children.map(children, (child) => {
       // Checking isValidElement is the safe way and avoids a typescript
       // error too.
       if (React.isValidElement(child)) {
-        // @ts-expect-error TODO: fix this
         return React.cloneElement(child, { innerRef: this.formRef });
       }
       return child;
@@ -105,10 +127,22 @@ export class GenericInputModal extends Component<Props, State> {
         okText={okText}
         cancelText={cancelText}
         confirmLoading={isSubmitting}
+        okButtonProps={okButtonProps}
         onCancel={this.handleCancel}
         footer={footer}
         centered
       >
+        {submissionError && (
+          <>
+            <Alert
+              componentId="mlflow.generic_input_modal.submission_error"
+              closable={false}
+              message={submissionError}
+              type="error"
+            />
+            <Spacer />
+          </>
+        )}
         {displayForm}
       </Modal>
     );

@@ -1,24 +1,43 @@
 """
 Utilities for validating user inputs such as metric names and parameter names.
 """
+
+import ipaddress
+import json
 import logging
 import numbers
 import posixpath
 import re
-from typing import List
+import socket
+import threading
+import urllib.parse
+from fnmatch import fnmatch
+from typing import Any
 
 from mlflow.entities import Dataset, DatasetInput, InputTag, Param, RunTag
-from mlflow.environment_variables import MLFLOW_TRUNCATE_LONG_VALUES
+from mlflow.entities.model_registry.prompt_version import PROMPT_TEXT_TAG_KEY
+from mlflow.entities.webhook import WebhookEvent
+from mlflow.environment_variables import (
+    _MLFLOW_WEBHOOK_ALLOW_PRIVATE_IPS,
+    _MLFLOW_WEBHOOK_ALLOWED_SCHEMES,
+    MLFLOW_ARTIFACT_LOCATION_MAX_LENGTH,
+    MLFLOW_ICON_URL_ALLOW_PRIVATE_IPS,
+    MLFLOW_ICON_URL_ALLOWED_DOMAINS,
+    MLFLOW_ICON_URL_ALLOWED_SCHEMES,
+    MLFLOW_TRUNCATE_LONG_VALUES,
+)
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
-from mlflow.store.db.db_types import DATABASE_ENGINES
+from mlflow.utils.os import is_windows
 from mlflow.utils.string_utils import is_string_type
 
 _logger = logging.getLogger(__name__)
 
-# Regex for valid param and metric names: may only contain slashes, alphanumerics,
-# underscores, periods, dashes, and spaces.
-_VALID_PARAM_AND_METRIC_NAMES = re.compile(r"^[/\w.\- ]*$")
+_MAX_MCP_ICONS_PER_LIST = 100
+_MAX_MCP_TOOLS_PER_LIST = 1000
+_HOSTNAME_RESOLUTION_TIMEOUT_SECONDS = 5.0
+_MAX_CONCURRENT_HOSTNAME_RESOLUTIONS = 8
+_HOSTNAME_RESOLUTION_SEMAPHORE = threading.BoundedSemaphore(_MAX_CONCURRENT_HOSTNAME_RESOLUTIONS)
 
 # Regex for valid run IDs: must be an alphanumeric string of length 1 to 256.
 _RUN_ID_REGEX = re.compile(r"^[a-zA-Z0-9][\w\-]{0,255}$")
@@ -34,10 +53,8 @@ _REGISTERED_MODEL_ALIAS_REGEX = re.compile(r"^[\w\-]*$")
 # Regex for valid registered model alias to prevent conflict with version aliases.
 _REGISTERED_MODEL_ALIAS_VERSION_REGEX = re.compile(r"^[vV]\d+$")
 
-_BAD_CHARACTERS_MESSAGE = (
-    "Names may only contain alphanumerics, underscores (_), dashes (-), periods (.),"
-    " spaces ( ), and slashes (/)."
-)
+# The reserver "latest" alias name
+_REGISTERED_MODEL_ALIAS_LATEST = "latest"
 
 _BAD_ALIAS_CHARACTERS_MESSAGE = (
     "Names may only contain alphanumerics, underscores (_), and dashes (-)."
@@ -51,16 +68,21 @@ MAX_DATASETS_PER_BATCH = 1000
 MAX_ENTITIES_PER_BATCH = 1000
 MAX_BATCH_LOG_REQUEST_SIZE = int(1e6)
 MAX_PARAM_VAL_LENGTH = 6000
-MAX_TAG_VAL_LENGTH = 5000
+MAX_TAG_VAL_LENGTH = 8000
+MAX_EXPERIMENT_NAME_LENGTH = 500
 MAX_EXPERIMENT_TAG_KEY_LENGTH = 250
-MAX_EXPERIMENT_TAG_VAL_LENGTH = 5000
+MAX_EXPERIMENT_TAG_VAL_LENGTH = 20000
+MAX_CUSTOM_VIEWS_PER_EXPERIMENT = 50
 MAX_ENTITY_KEY_LENGTH = 250
 MAX_MODEL_REGISTRY_TAG_KEY_LENGTH = 250
-MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH = 5000
+MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH = 100_000
 MAX_EXPERIMENTS_LISTED_PER_PAGE = 50000
 MAX_DATASET_NAME_SIZE = 500
 MAX_DATASET_DIGEST_SIZE = 36
-MAX_DATASET_SCHEMA_SIZE = 65535  # 64KB -1 (the db limit for TEXT column)
+# 1MB -1, the db limit for MEDIUMTEXT column is 16MB, but
+# we restrict to 1MB because user might log lots of datasets
+# to a single run, 16MB increases burden on db
+MAX_DATASET_SCHEMA_SIZE = 1048575
 MAX_DATASET_SOURCE_SIZE = 65535  # 64KB -1 (the db limit for TEXT column)
 MAX_DATASET_PROFILE_SIZE = 16777215  # 16MB -1 (the db limit for MEDIUMTEXT column)
 MAX_INPUT_TAG_KEY_SIZE = 255
@@ -68,8 +90,8 @@ MAX_INPUT_TAG_VALUE_SIZE = 500
 MAX_REGISTERED_MODEL_ALIAS_LENGTH = 255
 MAX_TRACE_TAG_KEY_LENGTH = 250
 MAX_TRACE_TAG_VAL_LENGTH = 8000
-
-_UNSUPPORTED_DB_TYPE_MSG = "Supported database engines are {%s}" % ", ".join(DATABASE_ENGINES)
+MAX_TRACE_ARCHIVAL_RETENTION_LENGTH = 32
+_TRACE_ARCHIVAL_RETENTION_REGEX = re.compile(r"^[1-9][0-9]*[mhd]$")
 
 PARAM_VALIDATION_MSG = """
 
@@ -100,33 +122,241 @@ model and prevent parameter key collisions within the
 tracking store."""
 
 
+def invalid_value(path, value, message=None):
+    """
+    Compose a standardized error message for invalid parameter values.
+    """
+    formattedValue = json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    if message:
+        return f"Invalid value {formattedValue} for parameter '{path}' supplied: {message}"
+    else:
+        return f"Invalid value {formattedValue} for parameter '{path}' supplied."
+
+
+def missing_value(path):
+    return f"Missing value for required parameter '{path}'."
+
+
+def not_integer_value(path, value):
+    return f"Parameter '{path}' must be an integer, got '{value}'."
+
+
+def exceeds_maximum_length(path, limit):
+    return f"'{path}' exceeds the maximum length of {limit} characters"
+
+
+def _validate_trace_archival_retention_string(
+    value: Any, *, parameter_name: str | None = None
+) -> str:
+    if not is_string_type(value):
+        if parameter_name is not None:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid value for '{parameter_name}'. Expected a duration in the form "
+                "`<int><unit>`, where unit is one of 'm', 'h', or 'd' (for example '30d' or "
+                "'12h')."
+            )
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival retention must be in the form `<int><unit>`, "
+            "where unit is one of 'm', 'h', or 'd'."
+        )
+
+    trimmed = value.strip()
+    if len(trimmed) > MAX_TRACE_ARCHIVAL_RETENTION_LENGTH:
+        if parameter_name is not None:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid value for '{parameter_name}'. Maximum length is 32 characters."
+            )
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival duration must be at most 32 characters."
+        )
+
+    if _TRACE_ARCHIVAL_RETENTION_REGEX.fullmatch(trimmed) is None:
+        if parameter_name is not None:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid value for '{parameter_name}'. Expected a duration in the form "
+                "`<int><unit>`, where unit is one of 'm', 'h', or 'd' (for example '30d' or "
+                "'12h')."
+            )
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival retention must be in the form `<int><unit>`, "
+            "where unit is one of 'm', 'h', or 'd'."
+        )
+
+    return trimmed
+
+
+def _validate_trace_archival_location(value: Any, *, parameter_name: str | None = None) -> str:
+    if not is_string_type(value):
+        if parameter_name is not None:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid value for '{parameter_name}'. Expected a URI string."
+            )
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival location must be a URI string."
+        )
+
+    trimmed = value.strip()
+    parsed = urllib.parse.urlparse(trimmed)
+    if not parsed.scheme:
+        if parameter_name is not None:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid value for '{parameter_name}'. Expected a URI string."
+            )
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival location must be a URI string."
+        )
+    if parsed.scheme == "mlflow-artifacts":
+        if parameter_name is not None:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid value for '{parameter_name}'. Trace archival location cannot use "
+                "the proxy-only `mlflow-artifacts:` scheme."
+            )
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival location cannot use the proxy-only `mlflow-artifacts:` scheme."
+        )
+    return trimmed
+
+
+def _validate_trace_archival_repository_support(
+    value: Any, *, parameter_name: str | None = None
+) -> str:
+    location = _validate_trace_archival_location(value, parameter_name=parameter_name)
+    parameter_name = parameter_name or "trace_archival_location"
+
+    # Imported lazily to avoid a module import cycle with artifact repository validation helpers.
+    from mlflow.store.artifact.artifact_repo import ArtifactRepository
+    from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
+    from mlflow.store.artifact.databricks_artifact_repo import DatabricksArtifactRepository
+    from mlflow.store.artifact.dbfs_artifact_repo import DbfsRestArtifactRepository
+
+    artifact_repo = get_artifact_repository(location)
+    if isinstance(artifact_repo, DatabricksArtifactRepository):
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid value for '{parameter_name}'. Trace archival location {location!r} "
+            "resolves to a Databricks trace artifact repository that does not support "
+            "archived trace reads."
+        )
+    if isinstance(artifact_repo, DbfsRestArtifactRepository) or (
+        type(artifact_repo).delete_artifacts is ArtifactRepository.delete_artifacts
+    ):
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid value for '{parameter_name}'. Trace archival location {location!r} "
+            "resolves to an artifact repository that does not support deleting archived payloads."
+        )
+    return location
+
+
+def _parse_trace_archival_duration_config(
+    value: str | None,
+    *,
+    duration_key: str,
+    expected_type: str | None = None,
+    allow_missing_duration: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+
+    try:
+        payload = json.loads(value)
+    except Exception as e:
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival config must be encoded as a JSON object."
+        ) from e
+
+    if not isinstance(payload, dict):
+        raise MlflowException.invalid_parameter_value(
+            "Trace archival config must be encoded as a JSON object."
+        )
+
+    if expected_type is not None and payload.get("type") != expected_type:
+        raise MlflowException.invalid_parameter_value(
+            f"Trace archival config must use type '{expected_type}'."
+        )
+
+    duration_value = payload.get(duration_key)
+    if duration_value is None and allow_missing_duration:
+        return None
+
+    return _validate_trace_archival_retention_string(duration_value)
+
+
+def _validate_trace_experiment_tag(key: str, value: Any) -> None:
+    # Import lazily to avoid coupling the generic validation module to tracing at import time.
+    from mlflow.tracing.constant import TraceExperimentTagKey
+
+    if key == TraceExperimentTagKey.ARCHIVAL_RETENTION:
+        _parse_trace_archival_duration_config(
+            value,
+            duration_key="value",
+            expected_type="duration",
+        )
+    elif key == TraceExperimentTagKey.ARCHIVE_NOW:
+        _parse_trace_archival_duration_config(
+            value,
+            duration_key="older_than",
+            allow_missing_duration=True,
+        )
+
+
+def append_to_json_path(currentPath, value):
+    if not currentPath:
+        return value
+
+    if value.startswith("["):
+        return f"{currentPath}{value}"
+
+    return f"{currentPath}.{value}"
+
+
 def bad_path_message(name):
     return (
         "Names may be treated as files in certain cases, and must not resolve to other names"
-        " when treated as such. This name would resolve to '%s'"
-    ) % posixpath.normpath(name)
+        f" when treated as such. This name would resolve to {posixpath.normpath(name)!r}"
+    )
+
+
+def validate_param_and_metric_name(name):
+    # In windows system valid param and metric names: may only contain slashes, alphanumerics,
+    # underscores, periods, dashes, and spaces.
+    if is_windows():
+        return re.match(r"^[/\w.\- ]*$", name)
+
+    # For other system valid param and metric names: may only contain slashes, alphanumerics,
+    # underscores, periods, dashes, colons, and spaces.
+    return re.match(r"^[/\w.\- :]*$", name)
+
+
+def bad_character_message():
+    # Valid param and metric names may only contain slashes, alphanumerics, underscores,
+    # periods, dashes, colons, and spaces. For windows param and metric names can not contain colon
+    msg = (
+        "Names may only contain alphanumerics, underscores (_), dashes (-), periods (.),"
+        " spaces ( ){} and slashes (/)."
+    )
+    return msg.format("") if is_windows() else msg.format(", colon(:)")
 
 
 def path_not_unique(name):
     norm = posixpath.normpath(name)
-    return norm != name or norm == "." or norm.startswith("..") or norm.startswith("/")
+    return norm != str(name) or norm == "." or norm.startswith("..") or norm.startswith("/")
 
 
-def _validate_metric_name(name):
+def _validate_metric_name(name, path="name"):
     """Check that `name` is a valid metric name and raise an exception if it isn't."""
     if name is None:
         raise MlflowException(
-            f"Metric name cannot be None. {_MISSING_KEY_NAME_MESSAGE}",
+            invalid_value(path, name, f"Metric name cannot be None. {_MISSING_KEY_NAME_MESSAGE}"),
             error_code=INVALID_PARAMETER_VALUE,
         )
-    if not _VALID_PARAM_AND_METRIC_NAMES.match(name):
+    if not validate_param_and_metric_name(name):
         raise MlflowException(
-            f"Invalid metric name: '{name}'. {_BAD_CHARACTERS_MESSAGE}",
+            invalid_value(path, name, bad_character_message()),
             INVALID_PARAMETER_VALUE,
         )
     if path_not_unique(name):
         raise MlflowException(
-            f"Invalid metric name: '{name}'. {bad_path_message(name)}",
+            invalid_value(path, name, bad_path_message(name)),
             INVALID_PARAMETER_VALUE,
         )
 
@@ -140,58 +370,79 @@ def _is_numeric(value):
     return not isinstance(value, bool) and isinstance(value, numbers.Number)
 
 
-def _validate_metric(key, value, timestamp, step):
+def _validate_metric(key, value, timestamp, step, path=""):
     """
     Check that a metric with the specified key, value, timestamp, and step is valid and raise an
     exception if it isn't.
     """
-    _validate_metric_name(key)
+    _validate_metric_name(key, append_to_json_path(path, "name"))
+
+    # If invocated via log_metric, no prior validation of the presence of the value was done.
+    if value is None:
+        raise MlflowException(
+            missing_value(append_to_json_path(path, "value")),
+            INVALID_PARAMETER_VALUE,
+        )
+
     # value must be a Number
     # since bool is an instance of Number check for bool additionally
     if not _is_numeric(value):
         raise MlflowException(
-            f"Got invalid value {value} for metric '{key}' (timestamp={timestamp}). "
-            "Please specify value as a valid double (64-bit floating point)",
+            invalid_value(
+                append_to_json_path(path, "value"),
+                value,
+                f"(timestamp={timestamp}). "
+                f"Please specify value as a valid double (64-bit floating point)",
+            ),
             INVALID_PARAMETER_VALUE,
         )
 
     if not isinstance(timestamp, numbers.Number) or timestamp < 0:
         raise MlflowException(
-            f"Got invalid timestamp {timestamp} for metric '{key}' (value={value}). "
-            "Timestamp must be a nonnegative long (64-bit integer) ",
+            invalid_value(
+                append_to_json_path(path, "timestamp"),
+                timestamp,
+                f"metric '{key}' (value={value}). "
+                f"Timestamp must be a nonnegative long (64-bit integer) ",
+            ),
             INVALID_PARAMETER_VALUE,
         )
 
     if not isinstance(step, numbers.Number):
         raise MlflowException(
-            f"Got invalid step {step} for metric '{key}' (value={value}). "
-            "Step must be a valid long (64-bit integer).",
+            invalid_value(
+                append_to_json_path(path, "step"),
+                step,
+                f"metric '{key}' (value={value}). Step must be a valid long (64-bit integer).",
+            ),
             INVALID_PARAMETER_VALUE,
         )
 
     _validate_length_limit("Metric name", MAX_ENTITY_KEY_LENGTH, key)
 
 
-def _validate_param(key, value):
+def _validate_param(key, value, path=""):
     """
     Check that a param with the specified key & value is valid and raise an exception if it
     isn't.
     """
-    _validate_param_name(key)
+    _validate_param_name(key, append_to_json_path(path, "key"))
     return Param(
         _validate_length_limit("Param key", MAX_ENTITY_KEY_LENGTH, key),
         _validate_length_limit("Param value", MAX_PARAM_VAL_LENGTH, value, truncate=True),
     )
 
 
-def _validate_tag(key, value):
+def _validate_tag(key, value, path=""):
     """
     Check that a tag with the specified key & value is valid and raise an exception if it isn't.
     """
-    _validate_tag_name(key)
+    _validate_tag_name(key, append_to_json_path(path, "key"))
     return RunTag(
-        _validate_length_limit("Tag key", MAX_ENTITY_KEY_LENGTH, key),
-        _validate_length_limit("Tag value", MAX_TAG_VAL_LENGTH, value, truncate=True),
+        _validate_length_limit(append_to_json_path(path, "key"), MAX_ENTITY_KEY_LENGTH, key),
+        _validate_length_limit(
+            append_to_json_path(path, "value"), MAX_TAG_VAL_LENGTH, value, truncate=True
+        ),
     )
 
 
@@ -200,8 +451,9 @@ def _validate_experiment_tag(key, value):
     Check that a tag with the specified key & value is valid and raise an exception if it isn't.
     """
     _validate_tag_name(key)
-    _validate_length_limit("Tag key", MAX_EXPERIMENT_TAG_KEY_LENGTH, key)
-    _validate_length_limit("Tag value", MAX_EXPERIMENT_TAG_VAL_LENGTH, value)
+    _validate_length_limit("key", MAX_EXPERIMENT_TAG_KEY_LENGTH, key)
+    _validate_length_limit("value", MAX_EXPERIMENT_TAG_VAL_LENGTH, value)
+    _validate_trace_experiment_tag(key, value)
 
 
 def _validate_registered_model_tag(key, value):
@@ -209,8 +461,8 @@ def _validate_registered_model_tag(key, value):
     Check that a tag with the specified key & value is valid and raise an exception if it isn't.
     """
     _validate_tag_name(key)
-    _validate_length_limit("Registered model key", MAX_MODEL_REGISTRY_TAG_KEY_LENGTH, key)
-    _validate_length_limit("Registered model value", MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH, value)
+    _validate_length_limit("key", MAX_MODEL_REGISTRY_TAG_KEY_LENGTH, key)
+    _validate_length_limit("value", MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH, value)
 
 
 def _validate_model_version_tag(key, value):
@@ -219,8 +471,15 @@ def _validate_model_version_tag(key, value):
     """
     _validate_tag_name(key)
     _validate_tag_value(value)
-    _validate_length_limit("Model version key", MAX_MODEL_REGISTRY_TAG_KEY_LENGTH, key)
-    _validate_length_limit("Model version value", MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH, value)
+    _validate_length_limit("key", MAX_MODEL_REGISTRY_TAG_KEY_LENGTH, key)
+
+    # Check prompt text tag particularly for showing friendly error message
+    if key == PROMPT_TEXT_TAG_KEY and len(value) > MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH:
+        raise MlflowException.invalid_parameter_value(
+            f"Prompt text exceeds max length of {MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH} characters.",
+        )
+
+    _validate_length_limit("value", MAX_MODEL_REGISTRY_TAG_VALUE_LENGTH, value)
 
 
 def _validate_param_keys_unique(params):
@@ -241,41 +500,41 @@ def _validate_param_keys_unique(params):
         )
 
 
-def _validate_param_name(name):
+def _validate_param_name(name, path="key"):
     """Check that `name` is a valid parameter name and raise an exception if it isn't."""
     if name is None:
         raise MlflowException(
-            f"Parameter name cannot be None. {_MISSING_KEY_NAME_MESSAGE}",
+            invalid_value(path, "", _MISSING_KEY_NAME_MESSAGE),
             error_code=INVALID_PARAMETER_VALUE,
         )
-    if not _VALID_PARAM_AND_METRIC_NAMES.match(name):
+    if not validate_param_and_metric_name(name):
         raise MlflowException(
-            f"Invalid parameter name: '{name}'. {_BAD_CHARACTERS_MESSAGE}",
+            invalid_value(path, name, bad_character_message()),
             INVALID_PARAMETER_VALUE,
         )
     if path_not_unique(name):
         raise MlflowException(
-            f"Invalid parameter name: '{name}'. {bad_path_message(name)}",
+            invalid_value(path, name, bad_path_message(name)),
             INVALID_PARAMETER_VALUE,
         )
 
 
-def _validate_tag_name(name):
+def _validate_tag_name(name, path="key"):
     """Check that `name` is a valid tag name and raise an exception if it isn't."""
     # Reuse param & metric check.
     if name is None:
         raise MlflowException(
-            f"Tag name cannot be None. {_MISSING_KEY_NAME_MESSAGE}",
+            missing_value(path),
             error_code=INVALID_PARAMETER_VALUE,
         )
-    if not _VALID_PARAM_AND_METRIC_NAMES.match(name):
+    if not validate_param_and_metric_name(name):
         raise MlflowException(
-            f"Invalid tag name: '{name}'. {_BAD_CHARACTERS_MESSAGE}",
+            invalid_value(path, name, bad_character_message()),
             INVALID_PARAMETER_VALUE,
         )
     if path_not_unique(name):
         raise MlflowException(
-            f"Invalid tag name: '{name}'. {bad_path_message(name)}",
+            invalid_value(path, name, bad_path_message(name)),
             INVALID_PARAMETER_VALUE,
         )
 
@@ -295,16 +554,15 @@ def _validate_length_limit(entity_name, limit, value, *, truncate=False):
         return value[:limit]
 
     raise MlflowException(
-        f"{entity_name} '{value[:250]}' had length {len(value)}, "
-        f"which exceeded length limit of {limit}",
+        exceeds_maximum_length(entity_name, limit),
         error_code=INVALID_PARAMETER_VALUE,
     )
 
 
-def _validate_run_id(run_id):
+def _validate_run_id(run_id, path="run_id"):
     """Check that `run_id` is a valid run ID and raise an exception if it isn't."""
     if _RUN_ID_REGEX.match(run_id) is None:
-        raise MlflowException(f"Invalid run ID: '{run_id}'", error_code=INVALID_PARAMETER_VALUE)
+        raise MlflowException(invalid_value(path, run_id), error_code=INVALID_PARAMETER_VALUE)
 
 
 def _validate_experiment_id(exp_id):
@@ -332,17 +590,20 @@ def _validate_batch_log_limits(metrics, params, tags):
     _validate_batch_limit(entity_name="tags", limit=MAX_PARAMS_TAGS_PER_BATCH, length=len(tags))
     total_length = len(metrics) + len(params) + len(tags)
     _validate_batch_limit(
-        entity_name="metrics, params, and tags", limit=MAX_ENTITIES_PER_BATCH, length=total_length
+        entity_name="metrics, params, and tags",
+        limit=MAX_ENTITIES_PER_BATCH,
+        length=total_length,
     )
 
 
 def _validate_batch_log_data(metrics, params, tags):
-    for metric in metrics:
-        _validate_metric(metric.key, metric.value, metric.timestamp, metric.step)
+    for index, metric in enumerate(metrics):
+        path = f"metrics[{index}]"
+        _validate_metric(metric.key, metric.value, metric.timestamp, metric.step, path=path)
     return (
         metrics,
-        [_validate_param(p.key, p.value) for p in params],
-        [_validate_tag(t.key, t.value) for t in tags],
+        [_validate_param(p.key, p.value, path=f"params[{idx}]") for (idx, p) in enumerate(params)],
+        [_validate_tag(t.key, t.value, path=f"tags[{idx}]") for (idx, t) in enumerate(tags)],
     )
 
 
@@ -359,13 +620,19 @@ def _validate_experiment_name(experiment_name):
     """Check that `experiment_name` is a valid string and raise an exception if it isn't."""
     if experiment_name == "" or experiment_name is None:
         raise MlflowException(
-            f"Invalid experiment name: '{experiment_name}'", error_code=INVALID_PARAMETER_VALUE
+            f"Invalid experiment name: '{experiment_name}'",
+            error_code=INVALID_PARAMETER_VALUE,
         )
 
     if not is_string_type(experiment_name):
         raise MlflowException(
             f"Invalid experiment name: {experiment_name}. Expects a string.",
             error_code=INVALID_PARAMETER_VALUE,
+        )
+
+    if len(experiment_name) > MAX_EXPERIMENT_NAME_LENGTH:
+        raise MlflowException.invalid_parameter_value(
+            exceeds_maximum_length("name", MAX_EXPERIMENT_NAME_LENGTH)
         )
 
 
@@ -382,18 +649,56 @@ def _validate_experiment_id_type(experiment_id):
         )
 
 
-def _validate_model_name(model_name):
-    if model_name is None or model_name == "":
-        raise MlflowException("Registered model name cannot be empty.", INVALID_PARAMETER_VALUE)
+def _validate_list_param(param_name: str, param_value: Any, allow_none: bool = False) -> None:
+    """
+    Validate that a parameter is a list and raise a helpful error if it isn't.
+
+    Args:
+        param_name: Name of the parameter being validated (e.g., "experiment_ids")
+        param_value: The value to validate
+        allow_none: If True, None is allowed. If False, None is treated as invalid.
+
+    Raises:
+        MlflowException: If the parameter is not a list (and not None when allow_none=True)
+    """
+    if allow_none and param_value is None:
+        return
+
+    if not isinstance(param_value, list):
+        raise MlflowException.invalid_parameter_value(
+            f"{param_name} must be a list, got {type(param_value).__name__}. "
+            f"Did you mean to use {param_name}=[{param_value!r}]?"
+        )
+
+
+def _validate_model_name(model_name: str) -> None:
+    if model_name is None or model_name.strip() == "":
+        raise MlflowException(missing_value("name"), error_code=INVALID_PARAMETER_VALUE)
+    invalid_chars = ("/", ":")
+    if any(c in model_name for c in invalid_chars):
+        raise MlflowException(
+            f"Invalid model name '{model_name}'. Names cannot contain '/' or ':'.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+    if path_not_unique(model_name):
+        raise MlflowException(
+            invalid_value("name", model_name, bad_path_message(model_name)),
+            INVALID_PARAMETER_VALUE,
+        )
+
+
+def _validate_model_renaming(model_new_name: str) -> None:
+    if model_new_name is None or str(model_new_name).strip() == "":
+        raise MlflowException(missing_value("new_name"), error_code=INVALID_PARAMETER_VALUE)
+    _validate_model_name(model_new_name)
 
 
 def _validate_model_version(model_version):
     try:
-        model_version = int(model_version)
+        return int(model_version)
     except ValueError:
         raise MlflowException(
-            f"Model version must be an integer, got '{model_version}'",
-            error_code=INVALID_PARAMETER_VALUE,
+            not_integer_value("version", model_version), error_code=INVALID_PARAMETER_VALUE
         )
 
 
@@ -408,15 +713,22 @@ def _validate_model_alias_name(model_alias_name):
             INVALID_PARAMETER_VALUE,
         )
     _validate_length_limit(
-        "Registered model alias name", MAX_REGISTERED_MODEL_ALIAS_LENGTH, model_alias_name
+        "Registered model alias name",
+        MAX_REGISTERED_MODEL_ALIAS_LENGTH,
+        model_alias_name,
     )
+
+
+def _validate_model_alias_name_reserved(model_alias_name):
     if model_alias_name.lower() == "latest":
         raise MlflowException(
-            "'latest' alias name (case insensitive) is reserved.", INVALID_PARAMETER_VALUE
+            "'latest' alias name (case insensitive) is reserved.",
+            INVALID_PARAMETER_VALUE,
         )
     if _REGISTERED_MODEL_ALIAS_VERSION_REGEX.match(model_alias_name):
         raise MlflowException(
-            f"Version alias name '{model_alias_name}' is reserved.", INVALID_PARAMETER_VALUE
+            f"Version alias name '{model_alias_name}' is reserved.",
+            INVALID_PARAMETER_VALUE,
         )
 
 
@@ -430,8 +742,13 @@ def _validate_experiment_artifact_location(artifact_location):
 
 def _validate_db_type_string(db_type):
     """validates db_type parsed from DB URI is supported"""
+    from mlflow.store.db.db_types import DATABASE_ENGINES
+
     if db_type not in DATABASE_ENGINES:
-        error_msg = f"Invalid database engine: '{db_type}'. '{_UNSUPPORTED_DB_TYPE_MSG}'"
+        error_msg = (
+            f"Invalid database engine: '{db_type}'. "
+            f"Supported database engines are {', '.join(DATABASE_ENGINES)}"
+        )
         raise MlflowException(error_msg, INVALID_PARAMETER_VALUE)
 
 
@@ -448,7 +765,7 @@ def _validate_tag_value(value):
         raise MlflowException("Tag value cannot be None", INVALID_PARAMETER_VALUE)
 
 
-def _validate_dataset_inputs(dataset_inputs: List[DatasetInput]):
+def _validate_dataset_inputs(dataset_inputs: list[DatasetInput]):
     for dataset_input in dataset_inputs:
         _validate_dataset(dataset_input.dataset)
         _validate_input_tags(dataset_input.tags)
@@ -467,32 +784,32 @@ def _validate_dataset(dataset: Dataset):
         raise MlflowException("Dataset source cannot be None", INVALID_PARAMETER_VALUE)
     if len(dataset.name) > MAX_DATASET_NAME_SIZE:
         raise MlflowException(
-            f"Dataset name exceeds the maximum length of {MAX_DATASET_NAME_SIZE}",
+            exceeds_maximum_length("name", MAX_DATASET_NAME_SIZE),
             INVALID_PARAMETER_VALUE,
         )
     if len(dataset.digest) > MAX_DATASET_DIGEST_SIZE:
         raise MlflowException(
-            f"Dataset digest exceeds the maximum length of {MAX_DATASET_DIGEST_SIZE}",
+            exceeds_maximum_length("digest", MAX_DATASET_DIGEST_SIZE),
             INVALID_PARAMETER_VALUE,
         )
     if len(dataset.source) > MAX_DATASET_SOURCE_SIZE:
         raise MlflowException(
-            f"Dataset source exceeds the maximum length of {MAX_DATASET_SOURCE_SIZE}",
+            exceeds_maximum_length("source", MAX_DATASET_SOURCE_SIZE),
             INVALID_PARAMETER_VALUE,
         )
     if dataset.schema is not None and len(dataset.schema) > MAX_DATASET_SCHEMA_SIZE:
         raise MlflowException(
-            f"Dataset schema exceeds the maximum length of {MAX_DATASET_SCHEMA_SIZE}",
+            exceeds_maximum_length("schema", MAX_DATASET_SCHEMA_SIZE),
             INVALID_PARAMETER_VALUE,
         )
     if dataset.profile is not None and len(dataset.profile) > MAX_DATASET_PROFILE_SIZE:
         raise MlflowException(
-            f"Dataset profile exceeds the maximum length of {MAX_DATASET_PROFILE_SIZE}",
+            exceeds_maximum_length("profile", MAX_DATASET_PROFILE_SIZE),
             INVALID_PARAMETER_VALUE,
         )
 
 
-def _validate_input_tags(input_tags: List[InputTag]):
+def _validate_input_tags(input_tags: list[InputTag]):
     for input_tag in input_tags:
         _validate_input_tag(input_tag)
 
@@ -506,12 +823,12 @@ def _validate_input_tag(input_tag: InputTag):
         raise MlflowException("InputTag value cannot be None", INVALID_PARAMETER_VALUE)
     if len(input_tag.key) > MAX_INPUT_TAG_KEY_SIZE:
         raise MlflowException(
-            f"InputTag key exceeds the maximum length of {MAX_INPUT_TAG_KEY_SIZE}",
+            exceeds_maximum_length("key", MAX_INPUT_TAG_KEY_SIZE),
             INVALID_PARAMETER_VALUE,
         )
     if len(input_tag.value) > MAX_INPUT_TAG_VALUE_SIZE:
         raise MlflowException(
-            f"InputTag value exceeds the maximum length of {MAX_INPUT_TAG_VALUE_SIZE}",
+            exceeds_maximum_length("value", MAX_INPUT_TAG_VALUE_SIZE),
             INVALID_PARAMETER_VALUE,
         )
 
@@ -521,10 +838,365 @@ def _validate_username(username):
         raise MlflowException("Username cannot be empty.", INVALID_PARAMETER_VALUE)
 
 
+def _validate_password(password) -> None:
+    if password is None or len(password) < 12:
+        raise MlflowException.invalid_parameter_value(
+            "Password must be a string longer than 12 characters."
+        )
+
+
 def _validate_trace_tag(key, value):
     _validate_tag_name(key)
-    key = _validate_length_limit("Trace tag key", MAX_TRACE_TAG_KEY_LENGTH, key)
-    value = _validate_length_limit(
-        "Trace tag value", MAX_TRACE_TAG_VAL_LENGTH, value, truncate=True
-    )
+    key = _validate_length_limit("key", MAX_TRACE_TAG_KEY_LENGTH, key)
+    value = _validate_length_limit("value", MAX_TRACE_TAG_VAL_LENGTH, value, truncate=True)
     return key, value
+
+
+def _validate_experiment_artifact_location_length(artifact_location: str):
+    max_length = MLFLOW_ARTIFACT_LOCATION_MAX_LENGTH.get()
+    if len(artifact_location) > max_length:
+        raise MlflowException(
+            "Invalid artifact path length. The length of the artifact path cannot be "
+            f"greater than {max_length} characters. To configure this limit, please set the "
+            "MLFLOW_ARTIFACT_LOCATION_MAX_LENGTH environment variable.",
+            INVALID_PARAMETER_VALUE,
+        )
+
+
+def _validate_logged_model_name(name: str | None) -> None:
+    if name is None:
+        return
+
+    bad_chars = ("/", ":", ".", "%", '"', "'")
+    if not name or any(c in name for c in bad_chars):
+        raise MlflowException(
+            f"Invalid model name ({name!r}) provided. Model name must be a non-empty string "
+            f"and cannot contain the following characters: {bad_chars}",
+            INVALID_PARAMETER_VALUE,
+        )
+
+
+_WEBHOOK_NAME_REGEX = re.compile(
+    r"^(?=.{1,63}$)"  # Total length between 1 and 63 characters
+    r"[a-z0-9]"  # Must start with letter or digit
+    r"([a-z0-9._-]*[a-z0-9])?$",  # Optional middle + end with letter/digit
+    re.IGNORECASE,
+)
+
+
+def _validate_webhook_name(name: str) -> None:
+    if not isinstance(name, str):
+        raise MlflowException.invalid_parameter_value(
+            f"Webhook name must be a string, got {type(name).__name__!r}"
+        )
+
+    if not _WEBHOOK_NAME_REGEX.fullmatch(name):
+        raise MlflowException.invalid_parameter_value(
+            f"Webhook name {name!r} is invalid. It must start and end with a letter or digit, "
+            "be less than 63 characters long, and contain only letters, digits, dots (.), "
+            "underscores (_), and hyphens (-)."
+        )
+
+
+def _resolve_hostname_with_timeout(hostname: str, field_name: str):
+    acquired = _HOSTNAME_RESOLUTION_SEMAPHORE.acquire(timeout=_HOSTNAME_RESOLUTION_TIMEOUT_SECONDS)
+    if not acquired:
+        raise MlflowException.invalid_parameter_value(
+            f"Timed out waiting to resolve {field_name} hostname {hostname!r} because "
+            "too many hostname resolutions are already in progress"
+        )
+
+    result: dict[str, Any] = {}
+
+    def _resolve():
+        try:
+            result["addr_infos"] = socket.getaddrinfo(hostname, None)
+        except Exception as e:
+            result["error"] = e
+        finally:
+            _HOSTNAME_RESOLUTION_SEMAPHORE.release()
+
+    thread = threading.Thread(target=_resolve, daemon=True, name="mlflow-hostname-resolution")
+    thread.start()
+    thread.join(timeout=_HOSTNAME_RESOLUTION_TIMEOUT_SECONDS)
+    if thread.is_alive():
+        raise MlflowException.invalid_parameter_value(
+            f"Timed out resolving {field_name} hostname {hostname!r} after "
+            f"{_HOSTNAME_RESOLUTION_TIMEOUT_SECONDS:g} seconds"
+        )
+    if "error" in result:
+        raise result["error"]
+    return result["addr_infos"]
+
+
+def _validate_hostname_resolves_to_public_ips(hostname: str, field_name: str) -> None:
+    try:
+        addr_infos = _resolve_hostname_with_timeout(hostname, field_name)
+    except (socket.gaierror, UnicodeError, ValueError) as e:
+        raise MlflowException.invalid_parameter_value(
+            f"Cannot resolve {field_name} hostname {hostname!r}: {e}"
+        ) from e
+
+    for addr_info in addr_infos:
+        try:
+            ip = ipaddress.ip_address(addr_info[4][0])
+        except ValueError as e:
+            raise MlflowException.invalid_parameter_value(
+                f"{field_name} hostname {hostname!r} resolved to an invalid IP address: {e}"
+            ) from e
+        if not ip.is_global:
+            raise MlflowException.invalid_parameter_value(
+                f"{field_name} must not resolve to a non-public IP address. "
+                f"{hostname!r} resolves to {ip}."
+            )
+
+
+def _validate_public_https_url(
+    url: str,
+    field_name: str = "URL",
+    allowed_schemes: list[str] | tuple[str, ...] | set[str] = ("https",),
+    allow_private_ips: bool = False,
+) -> None:
+    if not isinstance(url, str):
+        raise MlflowException.invalid_parameter_value(
+            f"{field_name} must be a string, got {type(url).__name__!r}"
+        )
+
+    if not url.strip():
+        raise MlflowException.invalid_parameter_value(
+            f"{field_name} cannot be empty or just whitespace: {url!r}"
+        )
+
+    try:
+        parsed_url = urllib.parse.urlparse(url)
+    except ValueError as e:
+        raise MlflowException.invalid_parameter_value(f"Invalid {field_name} {url!r}: {e!r}") from e
+
+    normalized_allowed_schemes = {scheme.lower() for scheme in allowed_schemes}
+    if parsed_url.scheme not in normalized_allowed_schemes:
+        scheme_list = ", ".join(f"{scheme!r}" for scheme in sorted(normalized_allowed_schemes))
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid {field_name} scheme: {parsed_url.scheme!r}. Allowed schemes are: "
+            f"{scheme_list}."
+        )
+
+    if parsed_url.username or parsed_url.password:
+        raise MlflowException.invalid_parameter_value(
+            f"{field_name} must not include embedded credentials: {url!r}"
+        )
+
+    hostname = parsed_url.hostname
+    if not hostname:
+        raise MlflowException.invalid_parameter_value(
+            f"{field_name} must include a hostname: {url!r}"
+        )
+
+    if not allow_private_ips:
+        _validate_hostname_resolves_to_public_ips(hostname, field_name)
+
+
+def _validate_mcp_icon_url(url: str) -> None:
+    """Validate an MCP icon URL on write/update requests.
+
+    Default behavior accepts only public HTTPS targets. This follows the
+    existing webhook pattern for scheme and private-IP controls, with an
+    optional hostname allowlist layered on top for stricter deployments.
+
+    Operators can further configure:
+    - ``MLFLOW_ICON_URL_ALLOWED_SCHEMES`` to allow schemes like ``http``
+    - ``MLFLOW_ICON_URL_ALLOW_PRIVATE_IPS=true`` to allow localhost /
+      loopback / private-network targets
+    - ``MLFLOW_ICON_URL_ALLOWED_DOMAINS`` for a strict hostname allowlist
+    """
+    allowed_schemes = MLFLOW_ICON_URL_ALLOWED_SCHEMES.get()
+    allow_private_ips = MLFLOW_ICON_URL_ALLOW_PRIVATE_IPS.get()
+    _validate_public_https_url(
+        url,
+        field_name="Icon URL",
+        allowed_schemes=allowed_schemes,
+        allow_private_ips=allow_private_ips,
+    )
+
+    allowed_domains = MLFLOW_ICON_URL_ALLOWED_DOMAINS.get()
+    if not allowed_domains:
+        return
+
+    hostname = urllib.parse.urlparse(url).hostname
+    if not hostname:
+        raise MlflowException.invalid_parameter_value(f"Icon URL must include a hostname: {url!r}")
+
+    normalized_hostname = hostname.lower()
+    normalized_allowed_domains = [pattern.lower() for pattern in allowed_domains]
+    if not any(fnmatch(normalized_hostname, pattern) for pattern in normalized_allowed_domains):
+        raise MlflowException.invalid_parameter_value(
+            f"Icon URL host {hostname!r} is not in the allowed domain list: "
+            f"{', '.join(allowed_domains)}."
+        )
+
+
+def _validate_mcp_icon_mime_type(mime_type: str | None) -> None:
+    if mime_type is None:
+        return
+
+    if not isinstance(mime_type, str):
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid icon mimeType {mime_type!r}. Allowed values must use the 'image/*' media "
+            "type."
+        )
+
+    normalized = mime_type.strip().lower()
+    if not normalized.startswith("image/") or normalized == "image/":
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid icon mimeType {mime_type!r}. Allowed values must use the 'image/*' "
+            "media type."
+        )
+
+
+def _validate_mcp_list_max_length(items: list[Any], field_name: str, max_length: int) -> None:
+    if len(items) > max_length:
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid {field_name}. It must contain at most {max_length} items."
+        )
+
+
+def _validate_mcp_initial_status(status: Any, field_name: str = "status") -> None:
+    normalized_status = getattr(status, "value", status)
+    if normalized_status not in {"draft", "active"}:
+        raise MlflowException.invalid_parameter_value(
+            f"Initial MCP server registration {field_name} must be 'draft' or 'active'."
+        )
+
+
+def _validate_mcp_icon_payloads(icons: Any, field_name: str = "icons") -> None:
+    if icons is None:
+        return
+
+    if not isinstance(icons, list):
+        raise MlflowException.invalid_parameter_value(f"Invalid {field_name}. Expected a list.")
+
+    _validate_mcp_list_max_length(icons, field_name, _MAX_MCP_ICONS_PER_LIST)
+
+    for idx, icon in enumerate(icons):
+        icon_field_name = f"{field_name}[{idx}]"
+        if not isinstance(icon, dict):
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid {icon_field_name}. Expected an object."
+            )
+        if "src" not in icon:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid {icon_field_name}. Missing required key 'src'."
+            )
+
+        _validate_mcp_icon_url(icon["src"])
+        _validate_mcp_icon_mime_type(icon.get("mimeType"))
+
+
+def _strip_mcp_icon_response_fields(
+    icons: list[dict[str, Any]] | None,
+    field_name: str = "icons",
+) -> list[dict[str, Any]] | None:
+    """Sanitize response-only icon fields before persisting write payloads.
+
+    ``source="server"`` is ignored (stripped) so clients can echo resolved server
+    icons on update. ``source="version"`` is rejected because writing it would
+    persist a version-resolved icon as an explicit server override.
+    """
+    if icons is None:
+        return None
+
+    sanitized: list[dict[str, Any]] = []
+    for idx, icon in enumerate(icons):
+        if not isinstance(icon, dict):
+            sanitized.append(icon)
+            continue
+
+        source = icon.get("source")
+        if source == "version":
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid {field_name}[{idx}].source: 'version' is response-only and "
+                "cannot be written. Writing it would persist a version-resolved icon "
+                "as a server override. Omit source, or send source='server' when "
+                "echoing a server icon."
+            )
+
+        # Ignore response-only source="server" (and drop any other source key).
+        sanitized.append({key: value for key, value in icon.items() if key != "source"})
+    return sanitized
+
+
+def _validate_mcp_tool_payloads(tools: Any, field_name: str = "tools") -> None:
+    if tools is None:
+        return
+
+    if not isinstance(tools, list):
+        raise MlflowException.invalid_parameter_value(f"Invalid {field_name}. Expected a list.")
+
+    _validate_mcp_list_max_length(tools, field_name, _MAX_MCP_TOOLS_PER_LIST)
+
+
+def _validate_webhook_url(url: str) -> None:
+    if not isinstance(url, str):
+        raise MlflowException.invalid_parameter_value(
+            f"Webhook URL must be a string, got {type(url).__name__!r}"
+        )
+
+    if not url.strip():
+        raise MlflowException.invalid_parameter_value(
+            f"Webhook URL cannot be empty or just whitespace: {url!r}"
+        )
+
+    try:
+        parsed_url = urllib.parse.urlparse(url)
+    except ValueError as e:
+        raise MlflowException.invalid_parameter_value(f"Invalid webhook URL {url!r}: {e!r}") from e
+    schemes = _MLFLOW_WEBHOOK_ALLOWED_SCHEMES.get()
+    if parsed_url.scheme not in schemes:
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid webhook URL scheme: {parsed_url.scheme!r}. "
+            f"Allowed schemes are: {', '.join(schemes)}."
+        )
+
+    hostname = parsed_url.hostname
+    if not hostname:
+        raise MlflowException.invalid_parameter_value(
+            f"Webhook URL must include a hostname: {url!r}"
+        )
+
+    if not _MLFLOW_WEBHOOK_ALLOW_PRIVATE_IPS.get():
+        _validate_hostname_resolves_to_public_ips(hostname, "Webhook URL")
+
+
+def _validate_webhook_events(events: list[WebhookEvent]) -> None:
+    if (
+        not events
+        or not isinstance(events, list)
+        or not all(isinstance(e, WebhookEvent) for e in events)
+    ):
+        raise MlflowException.invalid_parameter_value(
+            f"Webhook events must be a non-empty list of WebhookEvent objects: {events}."
+        )
+
+
+def _resolve_experiment_ids_and_locations(
+    experiment_ids: list[str] | None, locations: list[str] | None
+) -> list[str]:
+    if experiment_ids:
+        if locations:
+            raise MlflowException.invalid_parameter_value(
+                "`experiment_ids` is deprecated, use `locations` instead."
+            )
+        else:
+            locations = experiment_ids
+    if not locations:
+        return locations
+
+    if invalid_experiment_ids := [location for location in locations if "." in location]:
+        invalid_exp_ids_str = ", ".join(invalid_experiment_ids)
+        if len(invalid_exp_ids_str) > 20:
+            invalid_exp_ids_str = invalid_exp_ids_str[:20] + "..."
+        raise MlflowException.invalid_parameter_value(
+            "Locations must be a list of experiment IDs. "
+            f"Found invalid experiment IDs: {invalid_exp_ids_str}."
+        )
+
+    return locations

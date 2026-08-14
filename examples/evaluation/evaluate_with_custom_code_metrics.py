@@ -33,24 +33,22 @@ valid_code_metric = make_metric(
     eval_fn=eval_fn, greater_is_better=False, name="valid_python_code", version="v1"
 )
 
-eval_df = pd.DataFrame(
-    {
-        "input": [
-            "SELECT * FROM ",
-            "import pandas",
-            "def hello_world",
-        ],
-    }
-)
+eval_df = pd.DataFrame({
+    "input": [
+        "SELECT * FROM ",
+        "import pandas",
+        "def hello_world",
+    ],
+})
 
 with mlflow.start_run() as run:
     system_prompt = (
         "Generate code that is less than 50 characters. Return only python code and nothing else."
     )
     logged_model = mlflow.openai.log_model(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         task=openai.chat.completions,
-        artifact_path="model",
+        name="model",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "{question}"},

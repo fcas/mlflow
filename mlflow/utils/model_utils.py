@@ -1,9 +1,13 @@
+import contextlib
 import json
+import logging
 import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
+
+import yaml
 
 from mlflow.exceptions import MlflowException
 from mlflow.models import Model
@@ -19,11 +23,62 @@ from mlflow.store.artifact.runs_artifact_repo import RunsArtifactRepository
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils import get_parent_module
 from mlflow.utils.databricks_utils import is_in_databricks_runtime
-from mlflow.utils.file_utils import _copy_file_or_tree
+from mlflow.utils.file_utils import TempDir, _copy_file_or_tree
 from mlflow.utils.requirements_utils import _capture_imported_modules
 from mlflow.utils.uri import append_to_uri_path
 
 FLAVOR_CONFIG_CODE = "code"
+EXTRA_FILES_KEY = "extra_files"
+
+_logger = logging.getLogger(__name__)
+
+
+def _copy_extra_files(extra_files, path):
+    """Validates and copies extra files to the model directory.
+
+    Downloads extra files from URIs and copies them to an 'extra_files' subdirectory
+    within the model path.
+
+    Args:
+        extra_files: A list of URIs or local paths to extra files that should be saved
+            alongside the model. Remote URIs are resolved to absolute filesystem paths.
+        path: The local model path where the extra files will be stored.
+
+    Returns:
+        A dictionary with the extra_files configuration that should be added to the
+        flavor config. Returns an empty dict if extra_files is None or empty.
+
+    Raises:
+        TypeError: If extra_files is not a list.
+
+    Example:
+        >>> extra_files_config = _copy_extra_files(
+        ...     ["s3://bucket/f1.txt", "/local/f2.txt"], "/path/to/model"
+        ... )
+        >>> # extra_files_config will be:
+        >>> # {"extra_files": [{"path": "extra_files/f1.txt"}, {"path": "extra_files/f2.txt"}]}
+    """
+    if not extra_files:
+        return {}
+
+    if not isinstance(extra_files, list):
+        raise TypeError("Extra files argument should be a list")
+
+    extra_files_config = {EXTRA_FILES_KEY: []}
+
+    with TempDir() as tmp_extra_files_dir:
+        for extra_file in extra_files:
+            _download_artifact_from_uri(
+                artifact_uri=extra_file, output_path=tmp_extra_files_dir.path()
+            )
+            rel_path = os.path.join(EXTRA_FILES_KEY, os.path.basename(extra_file))
+            extra_files_config[EXTRA_FILES_KEY].append({"path": rel_path})
+        shutil.move(
+            tmp_extra_files_dir.path(),
+            os.path.join(path, EXTRA_FILES_KEY),
+        )
+
+    return extra_files_config
 
 
 def _get_all_flavor_configurations(model_path):
@@ -174,7 +229,7 @@ def _infer_and_copy_code_paths(flavor, path, default_subpath="code"):
     # It only picks necessary files, because:
     #  1. Reduce risk of logging files containing user credentials to MLflow
     #     artifact repository.
-    #  2. In databricks runtime, notebook files might exist under a code_path directory,
+    #  2. In databricks runtime, notebook files might exist under a code_paths directory,
     #     if logging the whole directory to MLflow artifact repository, these
     #     notebook files are not accessible and trigger exceptions. On the other
     #     hand, these notebook files are not used as code_paths modules because
@@ -223,34 +278,31 @@ def _validate_path_exists(path, name):
         raise MlflowException(
             message=(
                 f"Failed to copy the specified {name} path '{path}' into the model "
-                f"artifacts. The specified {name }path does not exist. Please specify a valid "
+                f"artifacts. The specified {name}path does not exist. Please specify a valid "
                 f"{name} path and try again."
             ),
             error_code=INVALID_PARAMETER_VALUE,
         )
 
 
-def _validate_and_copy_model_code_and_config_paths(code_path, config_path, path):
-    """Copies the model code from code_path to a directory.
+def _validate_and_copy_file_to_directory(file_path: str, dir_path: str, name: str):
+    """Copies the file at file_path to the directory at dir_path.
 
     Args:
-        code_path: A file containing model code that should be logged as an artifact.
-        config_path: A file containing model config code that should be logged as an artifact.
-        path: The local model path.
+        file_path: A file that should be logged as an artifact.
+        dir_path: The path of the directory to save the file to.
+        name: The name for the kind of file being copied.
     """
-    _validate_path_exists(code_path, "code")
-    _validate_path_exists(config_path, "config")
+    _validate_path_exists(file_path, name)
     try:
-        _copy_file_or_tree(src=code_path, dst=path)
-        if config_path:
-            _copy_file_or_tree(src=config_path, dst=path)
+        _copy_file_or_tree(src=file_path, dst=dir_path)
     except OSError as e:
         # A common error is code-paths includes Databricks Notebook. We include it in error
         # message when running in Databricks, but not in other envs tp avoid confusion.
         example = ", such as Databricks Notebooks" if is_in_databricks_runtime() else ""
         raise MlflowException(
             message=(
-                f"Failed to copy the specified code path '{code_path}' into the model "
+                f"Failed to copy the specified code path '{file_path}' into the model "
                 "artifacts. It appears that your code path includes file(s) that cannot "
                 f"be copied{example}. Please specify a code path that does not include "
                 "such files and try again.",
@@ -295,7 +347,7 @@ def _validate_onnx_session_options(onnx_session_options):
     """Validates that the specified onnx_session_options dict is valid.
 
     Args:
-        ort_session_options: The onnx_session_options dict to validate.
+        onnx_session_options: The onnx_session_options dict to validate.
     """
     import onnxruntime as ort
 
@@ -335,8 +387,8 @@ def _validate_onnx_session_options(onnx_session_options):
 
 
 def _get_overridden_pyfunc_model_config(
-    pyfunc_config: Dict[str, Any], load_config: Dict[str, Any], logger
-) -> Dict[str, Any]:
+    pyfunc_config: dict[str, Any], load_config: dict[str, Any], logger
+) -> dict[str, Any]:
     """
     Updates the inference configuration according to the model's configuration and the overrides.
     Only arguments already present in the inference configuration can be updated. The environment
@@ -345,7 +397,7 @@ def _get_overridden_pyfunc_model_config(
     """
 
     overrides = {}
-    if env_overrides := os.getenv("MLFLOW_PYFUNC_INFERENCE_CONFIG"):
+    if env_overrides := os.environ.get("MLFLOW_PYFUNC_INFERENCE_CONFIG"):
         logger.debug(
             "Inference configuration is being loaded from ``MLFLOW_PYFUNC_INFERENCE_CONFIG``"
             " environ."
@@ -381,6 +433,26 @@ def _get_overridden_pyfunc_model_config(
     return pyfunc_config
 
 
+def _validate_and_get_model_config_from_file(model_config):
+    model_config = os.path.abspath(model_config)
+    if os.path.exists(model_config):
+        with open(model_config) as file:
+            try:
+                return yaml.safe_load(file)
+            except yaml.YAMLError as e:
+                raise MlflowException(
+                    f"The provided `model_config` file '{model_config}' is not a valid YAML "
+                    f"file: {e}",
+                    error_code=INVALID_PARAMETER_VALUE,
+                )
+    else:
+        raise MlflowException(
+            "An invalid `model_config` file was passed. The provided `model_config` "
+            f"file '{model_config}'is not a valid file path.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+
+
 def _validate_pyfunc_model_config(model_config):
     """
     Validates the values passes in the model_config section. There are no typing
@@ -390,16 +462,74 @@ def _validate_pyfunc_model_config(model_config):
     if not model_config:
         return
 
-    if not isinstance(model_config, dict) or not all(isinstance(key, str) for key in model_config):
+    if isinstance(model_config, Path):
+        _validate_and_get_model_config_from_file(os.fspath(model_config))
+    elif isinstance(model_config, str):
+        _validate_and_get_model_config_from_file(model_config)
+    elif isinstance(model_config, dict) and all(isinstance(key, str) for key in model_config):
+        try:
+            json.dumps(model_config)
+        except (TypeError, OverflowError):
+            raise MlflowException(
+                "Values in the provided ``model_config`` are of an unsupported type. Only "
+                "JSON-serializable data types can be provided as values.",
+                error_code=INVALID_PARAMETER_VALUE,
+            )
+    else:
         raise MlflowException(
-            "An invalid ``model_config`` structure was passed. ``model_config`` must be of type "
-            "``dict`` with string keys."
+            "An invalid ``model_config`` structure was passed. ``model_config`` must be a "
+            "valid file path or of type ``dict`` with string keys.",
+            error_code=INVALID_PARAMETER_VALUE,
         )
 
-    try:
-        json.dumps(model_config)
-    except (TypeError, OverflowError):
-        raise MlflowException(
-            "Values in the provided ``model_config`` are of an unsupported type. Only "
-            "JSON-serializable data types can be provided as values."
-        )
+
+RECORD_ENV_VAR_ALLOWLIST = {
+    # api key related
+    "API_KEY",
+    "API_TOKEN",
+    # databricks auth related
+    "DATABRICKS_HOST",
+    "DATABRICKS_USERNAME",
+    "DATABRICKS_PASSWORD",
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_INSECURE",
+    "DATABRICKS_CLIENT_ID",
+    "DATABRICKS_CLIENT_SECRET",
+    "_DATABRICKS_WORKSPACE_HOST",
+    "_DATABRICKS_WORKSPACE_ID",
+}
+
+
+@contextlib.contextmanager
+def env_var_tracker():
+    """
+    Context manager for temporarily tracking environment variables accessed.
+    It tracks environment variables accessed during the context manager's lifetime.
+    """
+    from mlflow.environment_variables import MLFLOW_RECORD_ENV_VARS_IN_MODEL_LOGGING
+
+    tracked_env_names = set()
+
+    if MLFLOW_RECORD_ENV_VARS_IN_MODEL_LOGGING.get():
+        original_getitem = os._Environ.__getitem__
+        original_get = os._Environ.get
+
+        def updated_get_item(self, key):
+            result = original_getitem(self, key)
+            tracked_env_names.add(key)
+            return result
+
+        def updated_get(self, key, *args, **kwargs):
+            if key in self:
+                tracked_env_names.add(key)
+            return original_get(self, key, *args, **kwargs)
+
+        try:
+            os._Environ.__getitem__ = updated_get_item
+            os._Environ.get = updated_get
+            yield tracked_env_names
+        finally:
+            os._Environ.__getitem__ = original_getitem
+            os._Environ.get = original_get
+    else:
+        yield tracked_env_names

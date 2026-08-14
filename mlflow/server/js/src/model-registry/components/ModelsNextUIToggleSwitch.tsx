@@ -1,23 +1,12 @@
-import { useCallback, useState } from 'react';
+import { useState } from 'react';
 import { FormattedMessage, useIntl } from 'react-intl';
-import { ModelsNextUIPromoModal } from './ModelsNextUIPromoModal';
 import { Modal, Switch, Typography, useDesignSystemTheme } from '@databricks/design-system';
 import { useNextModelsUIContext } from '../hooks/useNextModelsUI';
-
-const promoModalSeenStorageKey = '_mlflow_model_registry_promo_modal_dismissed';
 
 export const ModelsNextUIToggleSwitch = () => {
   const { usingNextModelsUI, setUsingNextModelsUI } = useNextModelsUIContext();
 
-  const promoModalVisited = window.localStorage.getItem(promoModalSeenStorageKey) === 'true';
-
-  const [promoModalVisible, setPromoModalVisible] = useState(!promoModalVisited);
   const [confirmDisableModalVisible, setConfirmDisableModalVisible] = useState(false);
-
-  const setPromoModalVisited = useCallback(() => {
-    setPromoModalVisible(false);
-    window.localStorage.setItem(promoModalSeenStorageKey, 'true');
-  }, []);
 
   const intl = useIntl();
   const label = intl.formatMessage({
@@ -36,18 +25,15 @@ export const ModelsNextUIToggleSwitch = () => {
     <>
       <div style={{ display: 'flex', alignItems: 'center', gap: theme.spacing.xs }}>
         <label>{label}</label>
-        <Switch checked={usingNextModelsUI} aria-label={label} onChange={switchNextUI} />
+        <Switch
+          componentId="codegen_mlflow_app_src_model-registry_components_modelsnextuitoggleswitch.tsx_39"
+          checked={usingNextModelsUI}
+          aria-label={label}
+          onChange={switchNextUI}
+        />
       </div>
-      <ModelsNextUIPromoModal
-        visible={promoModalVisible}
-        onClose={() => {
-          setPromoModalVisited();
-        }}
-        onTryItNow={() => {
-          setPromoModalVisited();
-        }}
-      />
       <Modal
+        componentId="codegen_mlflow_app_src_model-registry_components_modelsnextuitoggleswitch.tsx_50"
         visible={confirmDisableModalVisible}
         title={
           <FormattedMessage
@@ -71,7 +57,11 @@ export const ModelsNextUIToggleSwitch = () => {
           description="Model registry > Switcher for the new model registry UI containing aliases > disable confirmation modal content"
           values={{
             link: (chunks) => (
-              <Typography.Link href="https://forms.gle/aMB4qDrhMeEm2r359" openInNewTab>
+              <Typography.Link
+                componentId="codegen_mlflow_app_src_model-registry_components_modelsnextuitoggleswitch.tsx_74"
+                href="https://forms.gle/aMB4qDrhMeEm2r359"
+                openInNewTab
+              >
                 {chunks}
               </Typography.Link>
             ),

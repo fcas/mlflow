@@ -5,8 +5,7 @@
  * annotations are already looking good, please remove this comment.
  */
 
-import Immutable from 'immutable';
-
+import { describe, test, expect } from '@jest/globals';
 import { ArtifactNode } from '../utils/ArtifactUtils';
 import {
   experimentsById,
@@ -33,11 +32,11 @@ import {
   runUuidsMatchingFilter,
   runDatasetsByUuid,
   datasetsByExperimentId,
+  runInfoOrderByUuid,
 } from './Reducers';
 import { mockExperiment, mockRunInfo } from '../utils/test-utils/ReduxStoreFixtures';
-import { RunTag, RunInfo, Param, Experiment, ExperimentTag } from '../sdk/MlflowMessages';
+import { RunTag, Param, ExperimentTag } from '../sdk/MlflowMessages';
 import {
-  SEARCH_EXPERIMENTS_API,
   GET_EXPERIMENT_API,
   GET_RUN_API,
   SEARCH_RUNS_API,
@@ -46,6 +45,7 @@ import {
   DELETE_TAG_API,
   LIST_ARTIFACTS_API,
   SET_EXPERIMENT_TAG_API,
+  DELETE_EXPERIMENT_TAG_API,
   SEARCH_DATASETS_API,
 } from '../actions';
 import { fulfilled, pending, rejected } from '../../common/utils/ActionUtils';
@@ -57,62 +57,19 @@ describe('test experimentsById', () => {
   test('should set up initial state correctly', () => {
     expect(experimentsById(undefined, {})).toEqual({});
   });
-  test('searchExperiments correctly updates empty state', () => {
-    const experimentA = mockExperiment('experiment01', 'experimentA');
-    const experimentB = mockExperiment('experiment02', 'experimentB');
-    const state = undefined;
-    const action = {
-      type: fulfilled(SEARCH_EXPERIMENTS_API),
-      payload: {
-        experiments: [experimentA.toJSON(), experimentB.toJSON()],
-      },
-    };
-    const new_state = experimentsById(state, action);
-    expect(new_state).toEqual({
-      [experimentA.experiment_id]: experimentA,
-      [experimentB.experiment_id]: experimentB,
-    });
-  });
-  test('searchExperiments correctly updates state', () => {
-    const newA = mockExperiment('experiment01', 'experimentA');
-    const newB = mockExperiment('experiment02', 'experimentB');
-    const preserved = mockExperiment('experiment03', 'still exists');
-    const removed = mockExperiment('experiment04', 'removed');
-    const replacedOld = mockExperiment('experiment05', 'replacedOld');
-    const replacedNew = mockExperiment('experiment05', 'replacedNew');
-    const state = deepFreeze({
-      [preserved.getExperimentId()]: preserved,
-      [removed.getExperimentId()]: removed,
-      [replacedOld.getExperimentId()]: replacedOld,
-    });
-    const action = {
-      type: fulfilled(SEARCH_EXPERIMENTS_API),
-      payload: {
-        experiments: [preserved.toJSON(), newA.toJSON(), newB.toJSON(), replacedNew.toJSON()],
-      },
-    };
-    const new_state = experimentsById(state, action);
-    expect(new_state).not.toEqual(state);
-    expect(new_state).toEqual({
-      [preserved.getExperimentId()]: preserved,
-      [newA.getExperimentId()]: newA,
-      [newB.getExperimentId()]: newB,
-      [replacedNew.getExperimentId()]: replacedNew,
-    });
-  });
   test('getExperiment correctly updates empty state', () => {
     const experimentA = mockExperiment('experiment01', 'experimentA');
     const state = {};
     const action = {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
-        experiment: experimentA.toJSON(),
+        experiment: experimentA,
       },
     };
     const new_state = experimentsById(state, action);
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [experimentA.experiment_id]: experimentA,
+      [experimentA.experimentId]: experimentA,
     });
   });
   test('getExperiment correctly updates non empty state', () => {
@@ -120,21 +77,21 @@ describe('test experimentsById', () => {
     const replacedOld = mockExperiment('experiment05', 'replacedOld');
     const replacedNew = mockExperiment('experiment05', 'replacedNew');
     const state = deepFreeze({
-      [preserved.getExperimentId()]: preserved,
-      [replacedOld.getExperimentId()]: replacedOld,
+      [preserved.experimentId]: preserved,
+      [replacedOld.experimentId]: replacedOld,
     });
     const action = {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
-        experiment: replacedNew.toJSON(),
+        experiment: replacedNew,
       },
     };
     const new_state = experimentsById(state, action);
     // make sure the reducer did not modify the original state
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [preserved.getExperimentId()]: preserved,
-      [replacedNew.getExperimentId()]: replacedNew,
+      [preserved.experimentId]: preserved,
+      [replacedNew.experimentId]: replacedNew,
     });
   });
   test('getExperiment correctly updates tags', () => {
@@ -145,25 +102,25 @@ describe('test experimentsById', () => {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
         experiment: {
-          experiment_id: experiment1.getExperimentId(),
+          experimentId: experiment1.experimentId,
           tags: [tag1],
         },
       },
     };
     const state1 = experimentsById(undefined, action1);
-    expect(state1.experiment1.tags).toEqual(Immutable.List([(ExperimentTag as any).fromJs(tag1)]));
+    expect(state1.experiment1.tags).toEqual([tag1]);
     const action2 = {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
         experiment: {
-          experiment_id: experiment1.getExperimentId(),
+          experimentId: experiment1.experimentId,
           tags: [tag1, tag2],
         },
       },
     };
     const state2 = experimentsById(state1, action2);
     const { tags } = state2.experiment1;
-    expect(tags).toEqual(Immutable.List([(ExperimentTag as any).fromJs(tag1), (ExperimentTag as any).fromJs(tag2)]));
+    expect(tags).toEqual([tag1, tag2]);
   });
 });
 
@@ -239,7 +196,7 @@ describe('test runDatasetsByUuid', () => {
         profile: '{}',
         schema: '{}',
         source: '{}',
-        source_type: 'local',
+        sourceType: 'local',
       },
       tags: [],
     });
@@ -258,20 +215,20 @@ describe('test runDatasetsByUuid', () => {
       payload: {
         runs: [
           // Run that will contain one dataset
-          { info: runA.toJSON(), inputs: { dataset_inputs: [dsAlpha] } },
+          { info: runA, inputs: { datasetInputs: [dsAlpha] } },
           // Run that will contain more datasets
-          { info: runB.toJSON(), inputs: { dataset_inputs: [dsBeta, dsGamma] } },
+          { info: runB, inputs: { datasetInputs: [dsBeta, dsGamma] } },
           // Run not containing any datasets
-          { info: runC.toJSON() },
+          { info: runC },
         ],
       },
     };
     const new_state = deepFreeze(runDatasetsByUuid(state, action));
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [runA.getRunUuid()]: [dsAlpha],
-      [runB.getRunUuid()]: [dsBeta, dsGamma],
-      [runC.getRunUuid()]: undefined,
+      [runA.runUuid]: [dsAlpha],
+      [runB.runUuid]: [dsBeta, dsGamma],
+      [runC.runUuid]: undefined,
     });
   });
 });
@@ -304,26 +261,26 @@ describe('test runInfosByUuid', () => {
       type: fulfilled(GET_RUN_API),
       payload: {
         run: {
-          info: runA.toJSON(),
+          info: runA,
         },
       },
     };
     const new_state_0 = deepFreeze(runInfosByUuid(undefined, actionA));
     expect(new_state_0).toEqual({
-      [runA.getRunUuid()]: runA,
+      [runA.runUuid]: runA,
     });
     const actionB = {
       type: fulfilled(GET_RUN_API),
       payload: {
         run: {
-          info: runB.toJSON(),
+          info: runB,
         },
       },
     };
     const new_state_1 = runInfosByUuid(new_state_0, actionB);
     expect(new_state_1).not.toEqual(new_state_0);
     expect(new_state_1).toEqual({
-      [runB.getRunUuid()]: runB,
+      [runB.runUuid]: runB,
     });
   });
 
@@ -334,14 +291,14 @@ describe('test runInfosByUuid', () => {
     const action = {
       type: fulfilled(SEARCH_RUNS_API),
       payload: {
-        runs: [{ info: runA.toJSON() }, { info: runB.toJSON() }],
+        runs: [{ info: runA }, { info: runB }],
       },
     };
     const new_state = deepFreeze(runInfosByUuid(state, action));
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [runA.getRunUuid()]: runA,
-      [runB.getRunUuid()]: runB,
+      [runA.runUuid]: runA,
+      [runB.runUuid]: runB,
     });
   });
 
@@ -354,23 +311,23 @@ describe('test runInfosByUuid', () => {
     const removed = mockRunInfo('removed');
     const newRun = mockRunInfo('new');
     const state = deepFreeze({
-      [preserved.getRunUuid()]: preserved,
-      [replacedOld.getRunUuid()]: replacedOld,
-      [removed.getRunUuid()]: removed,
+      [preserved.runUuid]: preserved,
+      [replacedOld.runUuid]: replacedOld,
+      [removed.runUuid]: removed,
     });
     const action = {
       type: fulfilled(SEARCH_RUNS_API),
       payload: {
-        runs: [{ info: preserved.toJSON() }, { info: replacedNew.toJSON() }, { info: newRun.toJSON() }],
+        runs: [{ info: preserved }, { info: replacedNew }, { info: newRun }],
       },
     };
     const new_state = runInfosByUuid(state, action);
     // make sure the reducer did not modify the original state
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [preserved.getRunUuid()]: preserved,
-      [replacedNew.getRunUuid()]: replacedNew,
-      [newRun.getRunUuid()]: newRun,
+      [preserved.runUuid]: preserved,
+      [replacedNew.runUuid]: replacedNew,
+      [newRun.runUuid]: newRun,
     });
   });
 
@@ -380,9 +337,9 @@ describe('test runInfosByUuid', () => {
     const replacedOld = mockRunInfo('replaced', 'old');
     const removed = mockRunInfo('removed');
     const state = deepFreeze({
-      [preserved.getRunUuid()]: preserved,
-      [replacedOld.getRunUuid()]: replacedOld,
-      [removed.getRunUuid()]: removed,
+      [preserved.runUuid]: preserved,
+      [replacedOld.runUuid]: replacedOld,
+      [removed.runUuid]: removed,
     });
     const action = {
       type: rejected(SEARCH_RUNS_API),
@@ -394,7 +351,7 @@ describe('test runInfosByUuid', () => {
     expect(new_state).toEqual({});
   });
 
-  test('test load more runs', () => {
+  test('load more runs', () => {
     const preserved = mockRunInfo('still exists');
     // @ts-expect-error TS(2345): Argument of type '"old"' is not assignable to para... Remove this comment to see the full error message
     const replacedOld = mockRunInfo('replaced', 'old');
@@ -403,24 +360,24 @@ describe('test runInfosByUuid', () => {
     const removed = mockRunInfo('removed');
     const newRun = mockRunInfo('new');
     const state = deepFreeze({
-      [preserved.getRunUuid()]: preserved,
-      [replacedOld.getRunUuid()]: replacedOld,
-      [removed.getRunUuid()]: removed,
+      [preserved.runUuid]: preserved,
+      [replacedOld.runUuid]: replacedOld,
+      [removed.runUuid]: removed,
     });
     const action = {
       type: fulfilled(LOAD_MORE_RUNS_API),
       payload: {
-        runs: [{ info: preserved.toJSON() }, { info: replacedNew.toJSON() }, { info: newRun.toJSON() }],
+        runs: [{ info: preserved }, { info: replacedNew }, { info: newRun }],
       },
     };
     const new_state = runInfosByUuid(state, action);
     // make sure the reducer did not modify the original state
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [preserved.getRunUuid()]: preserved,
-      [removed.getRunUuid()]: removed,
-      [replacedNew.getRunUuid()]: replacedNew,
-      [newRun.getRunUuid()]: newRun,
+      [preserved.runUuid]: preserved,
+      [removed.runUuid]: removed,
+      [replacedNew.runUuid]: replacedNew,
+      [newRun.runUuid]: newRun,
     });
   });
 });
@@ -469,8 +426,8 @@ describe('test modelVersionsByUuid', () => {
     const new_state = deepFreeze(modelVersionsByRunUuid(state, action));
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [runA.getRunUuid()]: [mvA],
-      [runB.getRunUuid()]: [mvB],
+      [runA.runUuid]: [mvA],
+      [runB.runUuid]: [mvB],
     });
   });
 
@@ -515,8 +472,8 @@ describe('test modelVersionsByUuid', () => {
       'run03',
     );
     const state = deepFreeze({
-      [run1.getRunUuid()]: [mvA],
-      [run2.getRunUuid()]: [mvB, mvC],
+      [run1.runUuid]: [mvA],
+      [run2.runUuid]: [mvB, mvC],
     });
     const action = {
       type: fulfilled(SEARCH_MODEL_VERSIONS),
@@ -528,9 +485,9 @@ describe('test modelVersionsByUuid', () => {
     // make sure the reducer did not modify the original state
     expect(new_state).not.toEqual(state);
     expect(new_state).toEqual({
-      [run1.getRunUuid()]: [mvA],
-      [run2.getRunUuid()]: [mvB],
-      [run3.getRunUuid()]: [mvD],
+      [run1.runUuid]: [mvA],
+      [run2.runUuid]: [mvB],
+      [run3.runUuid]: [mvD],
     });
   });
 });
@@ -579,7 +536,7 @@ describe('test params(tags)ByRunUuid', () => {
     key: key3,
     value: 'ijk',
   };
-  function reduceAndTest(reducer: any, initial_state: any, expected_state: any, action: any) {
+  function expectReduce(reducer: any, initial_state: any, expected_state: any, action: any) {
     const new_state = reducer(initial_state, action);
     expect(new_state).not.toEqual(initial_state);
     expect(new_state).toEqual(expected_state);
@@ -599,7 +556,7 @@ describe('test params(tags)ByRunUuid', () => {
         payload: {
           run: {
             // @ts-expect-error TS(2345): Argument of type '"experiment01"' is not assignabl... Remove this comment to see the full error message
-            info: mockRunInfo('run01', 'experiment01').toJSON(),
+            info: mockRunInfo('run01', 'experiment01'),
             data: {
               [paramOrTag]: vals,
             },
@@ -607,8 +564,8 @@ describe('test params(tags)ByRunUuid', () => {
         },
       };
     }
-    reduceAndTest(paramsByRunUuid, undefined, newState('params', empty_state), new_action('params', undefined));
-    reduceAndTest(
+    expectReduce(paramsByRunUuid, undefined, newState('params', empty_state), new_action('params', undefined));
+    expectReduce(
       tagsByRunUuid,
       undefined,
       newState('tags', empty_state),
@@ -617,13 +574,13 @@ describe('test params(tags)ByRunUuid', () => {
       // @ts-expect-error TS(2554): Expected 4 arguments, but got 5.
       undefined,
     );
-    reduceAndTest(
+    expectReduce(
       paramsByRunUuid,
       undefined,
       newState('params', expected_state),
       new_action('params', [val1, val2, val3]),
     );
-    reduceAndTest(tagsByRunUuid, undefined, newState('tags', expected_state), new_action('tags', [val1, val2, val3]));
+    expectReduce(tagsByRunUuid, undefined, newState('tags', expected_state), new_action('tags', [val1, val2, val3]));
   });
   test('getRunApi updates non empty state correctly', () => {
     const initial_state = deepFreeze({
@@ -653,7 +610,7 @@ describe('test params(tags)ByRunUuid', () => {
         payload: {
           run: {
             // @ts-expect-error TS(2345): Argument of type '"experiment01"' is not assignabl... Remove this comment to see the full error message
-            info: mockRunInfo('run01', 'experiment01').toJSON(),
+            info: mockRunInfo('run01', 'experiment01'),
             data: {
               [paramOrTag]: [val1, val3],
             },
@@ -661,13 +618,13 @@ describe('test params(tags)ByRunUuid', () => {
         },
       };
     }
-    reduceAndTest(
+    expectReduce(
       paramsByRunUuid,
       newState('params', initial_state),
       newState('params', expected_state),
       new_action('params'),
     );
-    reduceAndTest(tagsByRunUuid, newState('tags', initial_state), newState('tags', expected_state), new_action('tags'));
+    expectReduce(tagsByRunUuid, newState('tags', initial_state), newState('tags', expected_state), new_action('tags'));
   });
   test('search runs and load more apis updates non empty state correctly', () => {
     const initial_state = deepFreeze({
@@ -701,15 +658,15 @@ describe('test params(tags)ByRunUuid', () => {
         payload: {
           runs: [
             {
-              info: mockRunInfo('run01').toJSON(),
+              info: mockRunInfo('run01'),
               data: { [paramOrTag]: [val1_2, val3] },
             },
             {
-              info: mockRunInfo('run03').toJSON(),
+              info: mockRunInfo('run03'),
               data: { [paramOrTag]: [val3] },
             },
             {
-              info: mockRunInfo('run04').toJSON(),
+              info: mockRunInfo('run04'),
               data: { [paramOrTag]: undefined },
             },
           ],
@@ -722,7 +679,7 @@ describe('test params(tags)ByRunUuid', () => {
     };
     for (const paramOrTag of ['params', 'tags']) {
       for (const action_type of [SEARCH_RUNS_API, LOAD_MORE_RUNS_API]) {
-        reduceAndTest(
+        expectReduce(
           // @ts-expect-error TS(7053): Element implicitly has an 'any' type because expre... Remove this comment to see the full error message
           reducers[paramOrTag],
           newState(paramOrTag, initial_state),
@@ -749,7 +706,7 @@ describe('test params(tags)ByRunUuid', () => {
       };
     }
     // @ts-expect-error TS(2554): Expected 0 arguments, but got 1.
-    reduceAndTest(tagsByRunUuid, undefined, newState('tags', expected_state), new_action('tags'));
+    expectReduce(tagsByRunUuid, undefined, newState('tags', expected_state), new_action('tags'));
   });
   test('setTagApi updates non empty state correctly', () => {
     const initial_state = deepFreeze({
@@ -782,7 +739,7 @@ describe('test params(tags)ByRunUuid', () => {
         },
       };
     }
-    reduceAndTest(tagsByRunUuid, newState('tags', initial_state), newState('tags', expected_state), new_action());
+    expectReduce(tagsByRunUuid, newState('tags', initial_state), newState('tags', expected_state), new_action());
   });
   test('deleteTagApi works with empty state', () => {
     const expected_state = {};
@@ -795,9 +752,9 @@ describe('test params(tags)ByRunUuid', () => {
         },
       };
     }
-    reduceAndTest(tagsByRunUuid, undefined, newState('tags', expected_state), new_action());
+    expectReduce(tagsByRunUuid, undefined, newState('tags', expected_state), new_action());
   });
-  test('setTagApi updates non empty state correctly', () => {
+  test('deleteTagApi updates non empty state correctly', () => {
     const initial_state = deepFreeze({
       run01: {
         key1: val1,
@@ -826,7 +783,7 @@ describe('test params(tags)ByRunUuid', () => {
         },
       };
     }
-    reduceAndTest(tagsByRunUuid, newState('tags', initial_state), newState('tags', expected_state), new_action());
+    expectReduce(tagsByRunUuid, newState('tags', initial_state), newState('tags', expected_state), new_action());
   });
 });
 
@@ -1113,9 +1070,9 @@ describe('test artifactRootUriByRunUuid', () => {
       payload: {
         run: {
           info: {
-            run_uuid: 'run01',
-            experiment_id: '1',
-            artifact_uri: 'some/path',
+            runUuid: 'run01',
+            experimentId: '1',
+            artifactUri: 'some/path',
           },
           data: {},
         },
@@ -1133,9 +1090,9 @@ describe('test artifactRootUriByRunUuid', () => {
       payload: {
         run: {
           info: {
-            run_uuid: 'run02',
-            experiment_id: '1',
-            artifact_uri: 'some/other/path',
+            runUuid: 'run02',
+            experimentId: '1',
+            artifactUri: 'some/other/path',
           },
           data: {},
         },
@@ -1154,9 +1111,9 @@ describe('test artifactRootUriByRunUuid', () => {
       payload: {
         run: {
           info: {
-            run_uuid: 'run02',
-            experiment_id: '1',
-            artifact_uri: 'some/other/updated/path',
+            runUuid: 'run02',
+            experimentId: '1',
+            artifactUri: 'some/other/updated/path',
           },
           data: {},
         },
@@ -1178,7 +1135,7 @@ describe('test experimentTagsByExperimentId', () => {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
         experiment: {
-          experiment_id: 'experiment01',
+          experimentId: 'experiment01',
         },
       },
     });
@@ -1189,7 +1146,7 @@ describe('test experimentTagsByExperimentId', () => {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
         experiment: {
-          experiment_id: 'experiment01',
+          experimentId: 'experiment01',
           tags: [tag1, tag2],
         },
       },
@@ -1204,7 +1161,7 @@ describe('test experimentTagsByExperimentId', () => {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
         experiment: {
-          experiment_id: 'experiment02',
+          experimentId: 'experiment02',
           tags: [tag1],
         },
       },
@@ -1222,7 +1179,7 @@ describe('test experimentTagsByExperimentId', () => {
       type: fulfilled(GET_EXPERIMENT_API),
       payload: {
         experiment: {
-          experiment_id: 'experiment01',
+          experimentId: 'experiment01',
           tags: [tag1_2],
         },
       },
@@ -1275,6 +1232,60 @@ describe('test experimentTagsByExperimentId', () => {
       },
       experiment02: {
         key1: (ExperimentTag as any).fromJs(tag1),
+      },
+    });
+  });
+  test('delete experiment tag api', () => {
+    const initial_state = deepFreeze({
+      experiment01: {
+        key1: (ExperimentTag as any).fromJs(tag1),
+        key2: (ExperimentTag as any).fromJs(tag2),
+      },
+      experiment02: {
+        key1: (ExperimentTag as any).fromJs(tag1),
+      },
+    });
+    // Deleting one of several tags leaves the rest in place.
+    const state0 = experimentTagsByExperimentId(initial_state, {
+      type: fulfilled(DELETE_EXPERIMENT_TAG_API),
+      meta: {
+        experimentId: 'experiment01',
+        key: 'key1',
+      },
+    });
+    expect(state0).toEqual({
+      experiment01: {
+        key2: (ExperimentTag as any).fromJs(tag2),
+      },
+      experiment02: {
+        key1: (ExperimentTag as any).fromJs(tag1),
+      },
+    });
+    // Deleting the last tag for an experiment removes the experiment key entirely,
+    // mirroring the tagsByRunUuid DELETE_TAG_API behavior.
+    const state1 = experimentTagsByExperimentId(state0, {
+      type: fulfilled(DELETE_EXPERIMENT_TAG_API),
+      meta: {
+        experimentId: 'experiment02',
+        key: 'key1',
+      },
+    });
+    expect(state1).toEqual({
+      experiment01: {
+        key2: (ExperimentTag as any).fromJs(tag2),
+      },
+    });
+    // Deleting a nonexistent key is a no-op.
+    const state2 = experimentTagsByExperimentId(state1, {
+      type: fulfilled(DELETE_EXPERIMENT_TAG_API),
+      meta: {
+        experimentId: 'experiment01',
+        key: 'nonexistent',
+      },
+    });
+    expect(state2).toEqual({
+      experiment01: {
+        key2: (ExperimentTag as any).fromJs(tag2),
       },
     });
   });
@@ -1342,6 +1353,39 @@ describe('test datasetsByExperimentId', () => {
   });
 });
 
+describe('test runInfoOrderByUuid', () => {
+  const run1 = { info: { runUuid: 'run_1', experimentId: 'experiment_id' } };
+  const run2 = { info: { runUuid: 'run_2', experimentId: 'experiment_id' } };
+  const run3 = { info: { runUuid: 'run_3', experimentId: 'experiment_id' } };
+  test('get run api', () => {
+    let state = runInfoOrderByUuid(undefined, {
+      type: fulfilled(SEARCH_RUNS_API),
+      payload: {
+        runs: [run1, run2],
+      },
+    });
+    expect(state).toEqual(['run_1', 'run_2']);
+
+    state = runInfoOrderByUuid(state, {
+      type: fulfilled(SEARCH_RUNS_API),
+      payload: {
+        runs: [run1, run1, run3],
+      },
+    });
+
+    expect(state).toEqual(['run_1', 'run_3']);
+
+    state = runInfoOrderByUuid(state, {
+      type: fulfilled(LOAD_MORE_RUNS_API),
+      payload: {
+        runs: [run2, run2],
+      },
+    });
+
+    expect(state).toEqual(['run_1', 'run_3', 'run_2']);
+  });
+});
+
 describe('test public accessors', () => {
   function new_action({ type, id = 'a', runUuid = 'run01', payload = 'data' }: any) {
     return {
@@ -1353,27 +1397,6 @@ describe('test public accessors', () => {
       payload: payload,
     };
   }
-  test('Experiments', () => {
-    const A = (Experiment as any).fromJs({
-      experiment_id: 'a',
-      name: 'A',
-      tags: [{ name: 'a', value: 'A' }, 'b'],
-    });
-    const B = (Experiment as any).fromJs({
-      experiment_id: 'b',
-      name: 'B',
-    });
-    const action = new_action({
-      type: fulfilled(SEARCH_EXPERIMENTS_API),
-      payload: { experiments: [A.toJSON(), B.toJSON()] },
-    });
-    const state = rootReducer(undefined, action);
-    expect(state.entities.experimentTagsByExperimentId).toEqual({});
-    expect(getExperiments(state)).toEqual([A, B]);
-    expect(getExperiment(A.experiment_id, state)).toEqual(A);
-    expect(getExperimentTags(B.experiment_id, state)).toEqual({});
-    expect(getExperimentTags(A.experiment_id, state)).toEqual({});
-  });
   test('tags, params and runinfo', () => {
     const key1 = 'key1';
     const key2 = 'key2';
@@ -1394,13 +1417,11 @@ describe('test public accessors', () => {
       type: fulfilled(GET_RUN_API),
       payload: {
         run: {
-          info: (RunInfo as any)
-            .fromJs({
-              runUuid: 'run05',
-              experiment_id: 'experiment01',
-              artifact_uri: 'artifact_uri',
-            })
-            .toJSON(),
+          info: {
+            runUuid: 'run05',
+            experimentId: 'experiment01',
+            artifactUri: 'artifact_uri',
+          },
           data: {},
         },
       },
@@ -1416,7 +1437,7 @@ describe('test public accessors', () => {
       payload: {
         run: {
           // @ts-expect-error TS(2345): Argument of type '"experiment01"' is not assignabl... Remove this comment to see the full error message
-          info: mockRunInfo('run01', 'experiment01', 'articfact_uri').toJSON(),
+          info: mockRunInfo('run01', 'experiment01', 'articfact_uri'),
           data: {
             params: [val1, val2],
             tags: [val2, val3],
@@ -1434,18 +1455,16 @@ describe('test public accessors', () => {
       key3: (RunTag as any).fromJs({ key: 'key3', value: 'ijk' }),
     });
     expect(getRunInfo('run05', state)).toEqual(undefined);
-    expect(getRunInfo('run01', state)).toEqual(
-      (RunInfo as any).fromJs({
-        artifact_uri: 'articfact_uri',
-        end_time: undefined,
-        experiment_id: 'experiment01',
-        lifecycle_stage: undefined,
-        run_uuid: 'run01',
-        start_time: undefined,
-        status: undefined,
-        user_id: undefined,
-      }),
-    );
+    expect(getRunInfo('run01', state)).toEqual({
+      artifactUri: 'articfact_uri',
+      endTime: undefined,
+      experimentId: 'experiment01',
+      lifecycleStage: undefined,
+      runUuid: 'run01',
+      startTime: undefined,
+      status: undefined,
+      userId: undefined,
+    });
   });
   test('get apis', () => {
     const state0 = rootReducer(
@@ -1494,9 +1513,9 @@ describe('test public accessors', () => {
       payload: {
         run: {
           info: {
-            run_uuid: 'run01',
-            experiment_id: '1',
-            artifact_uri: 'some/path',
+            runUuid: 'run01',
+            experimentId: '1',
+            artifactUri: 'some/path',
           },
           data: {},
         },
@@ -1539,14 +1558,14 @@ describe('test public accessors', () => {
     );
   });
   test('getSharedParamKeysByRunUuids', () => {
-    const runA = (RunInfo as any).fromJs({
-      run_uuid: 'run01',
-      experiment_id: '1',
-    });
-    const runB = (RunInfo as any).fromJs({
-      run_uuid: 'run02',
-      experiment_id: '1',
-    });
+    const runA = {
+      runUuid: 'run01',
+      experimentId: '1',
+    };
+    const runB = {
+      runUuid: 'run02',
+      experimentId: '1',
+    };
     const actionA = {
       type: fulfilled(GET_RUN_API),
       meta: {
@@ -1554,7 +1573,7 @@ describe('test public accessors', () => {
       },
       payload: {
         run: {
-          info: runA.toJSON(),
+          info: runA,
           data: {
             params: [
               {
@@ -1577,7 +1596,7 @@ describe('test public accessors', () => {
       },
       payload: {
         run: {
-          info: runB.toJSON(),
+          info: runB,
           data: {
             params: [
               {

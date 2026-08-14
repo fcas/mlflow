@@ -5,9 +5,10 @@
  * annotations are already looking good, please remove this comment.
  */
 
+import { jest, describe, beforeEach, afterEach, test, expect } from '@jest/globals';
 import React from 'react';
-import { Typography } from '@databricks/design-system';
-import { shallowWithIntl, mountWithIntl } from 'common/utils/TestUtils.enzyme';
+import { DesignSystemProvider, Typography } from '@databricks/design-system';
+import { shallowWithIntl, mountWithIntl } from '@mlflow/mlflow/src/common/utils/TestUtils.enzyme';
 import { ArtifactView, ArtifactViewImpl } from './ArtifactView';
 import ShowArtifactTextView from './artifact-view-components/ShowArtifactTextView';
 import ShowArtifactImageView from './artifact-view-components/ShowArtifactImageView';
@@ -22,22 +23,24 @@ import configureStore from 'redux-mock-store';
 import promiseMiddleware from 'redux-promise-middleware';
 import thunk from 'redux-thunk';
 import Utils from '../../common/utils/Utils';
+import { getArtifactBlob } from '../../common/utils/ArtifactUtils';
+import { ErrorWrapper } from '../../common/utils/ErrorWrapper';
+import { MlflowService } from '../sdk/MlflowService';
+import { QueryClient, QueryClientProvider } from '@mlflow/mlflow/src/common/utils/reactQueryHooks';
+import { ServerInfoProvider } from '../hooks/useServerInfo';
 
 const { Text } = Typography;
 
 // Mock these methods because js-dom doesn't implement window.Request
 jest.mock('../../common/utils/ArtifactUtils', () => ({
-  ...jest.requireActual('../../common/utils/ArtifactUtils'),
+  ...jest.requireActual<typeof import('../../common/utils/ArtifactUtils')>('../../common/utils/ArtifactUtils'),
   // @ts-expect-error TS(2554): Expected 1 arguments, but got 0.
   getArtifactContent: jest.fn().mockResolvedValue(),
   // @ts-expect-error TS(2554): Expected 1 arguments, but got 0.
   getArtifactBytesContent: jest.fn().mockResolvedValue(),
-}));
-
-// mock this as feature-flags are hard-coded
-jest.mock('../../common/utils/FeatureUtils', () => ({
-  ...jest.requireActual('../../common/utils/FeatureUtils'),
-  shouldEnableLoggedArtifactTableView: jest.fn(() => false),
+  getArtifactBlob: jest
+    .fn<() => Promise<Blob>>()
+    .mockResolvedValue(new Blob(['dummy content'], { type: 'text/plain' })),
 }));
 
 describe('ArtifactView', () => {
@@ -57,15 +60,43 @@ describe('ArtifactView', () => {
   const getWrapper = (fakeStore: any, mockProps: any) =>
     mountWithIntl(
       <Provider store={fakeStore}>
-        <BrowserRouter>
-          <ArtifactView {...mockProps} />
-        </BrowserRouter>
+        <DesignSystemProvider>
+          <BrowserRouter>
+            <ArtifactView {...mockProps} />
+          </BrowserRouter>
+        </DesignSystemProvider>
       </Provider>,
     );
+  const getWrapperWithServerInfo = (fakeStore: any, mockProps: any, multipartDownloadsEnabled: boolean) => {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(['serverInfo'], {
+      store_type: null,
+      workspaces_enabled: false,
+      trace_archival_enabled: false,
+      multipart_uploads_enabled: false,
+      multipart_downloads_enabled: multipartDownloadsEnabled,
+    });
+
+    return mountWithIntl(
+      <QueryClientProvider client={queryClient}>
+        <ServerInfoProvider>
+          <Provider store={fakeStore}>
+            <DesignSystemProvider>
+              <BrowserRouter>
+                <ArtifactView {...mockProps} />
+              </BrowserRouter>
+            </DesignSystemProvider>
+          </Provider>
+        </ServerInfoProvider>
+      </QueryClientProvider>,
+    );
+  };
   beforeEach(() => {
     // TODO: remove global fetch mock by explicitly mocking all the service API calls
-    // @ts-expect-error TS(2322): Type 'Mock<Promise<{ ok: true; status: number; tex... Remove this comment to see the full error message
-    global.fetch = jest.fn(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('') }));
+    jest
+      .spyOn(global, 'fetch')
+      // @ts-expect-error TS(2322): Type 'Mock<Promise<{ ok: true; status: number; tex... Remove this comment to see the full error message
+      .mockImplementation(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('') }));
     const node = getTestArtifactNode();
     minimalProps = {
       runUuid: 'fakeUuid',
@@ -86,9 +117,7 @@ describe('ArtifactView', () => {
     });
 
     if (jest.isMockFunction(Utils.isModelRegistryEnabled)) {
-      // if jest.isMockFunction returns true, then .mockRestore exists
-      // @ts-expect-error TS(2339): Property 'mockRestore' does not exist on type '() => boolean'.
-      Utils.isModelRegistryEnabled.mockRestore();
+      jest.mocked(Utils.isModelRegistryEnabled).mockRestore();
     }
   });
   const getTestArtifactNode = () => {
@@ -123,25 +152,7 @@ describe('ArtifactView', () => {
     const emptyNode = new ArtifactNode(true, undefined);
     const props = { ...minimalProps, artifactNode: emptyNode };
     wrapper = getWrapper(getMockStore(emptyNode), props);
-    expect(wrapper.find('.no-artifacts')).toHaveLength(1);
-  });
-  test('should render selected file artifact', () => {
-    const props = { ...minimalProps };
-    wrapper = getWrapper(minimalStore, props);
-    const file1Element = wrapper.find('NodeHeader').at(0);
-    file1Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/file1');
-    expect(
-      wrapper.containsMatchingElement(
-        // @ts-expect-error TS(2322): Type '{ children: string; ellipsis: true; copyable... Remove this comment to see the full error message
-        <Text ellipsis copyable>
-          test_root/file1
-        </Text>,
-      ),
-    ).toEqual(true);
-    expect(wrapper.find('.artifact-info-size').html()).toContain('159B');
-    // Selecting a file artifact should display a download link
-    expect(wrapper.find('.artifact-info-link')).toHaveLength(1);
+    expect(wrapper.find('Empty')).toHaveLength(1);
   });
   test('should render text file in text artifact view', () => {
     // @ts-expect-error TS(2554): Expected 3 arguments, but got 2.
@@ -207,142 +218,275 @@ describe('ArtifactView', () => {
     geojsonFileElement.simulate('click');
     expect(wrapper.find(LazyShowArtifactMapView)).toHaveLength(1);
   });
-  test('should render selected directory artifact', () => {
-    const props = { ...minimalProps };
-    wrapper = getWrapper(minimalStore, props);
-    const dir1Element = wrapper.find('NodeHeader').at(1);
-    dir1Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/dir1');
-    // Now that `dir1` has been selected, we expect the visible artifact tree
-    // to contain 5 elements: file1, dir2, dir1, file2, and file3
-    expect(wrapper.find('NodeHeader')).toHaveLength(5);
-    // Size info should not be displayed
-    expect(wrapper.find('.artifact-info-size')).toHaveLength(0);
-  });
-  test('should not render register model button for directory with no MLmodel file', () => {
-    expect(Utils.isModelRegistryEnabled()).toEqual(true);
-    const props = { ...minimalProps };
-    wrapper = getWrapper(minimalStore, props);
-    const dir1Element = wrapper.find('NodeHeader').at(1);
-    dir1Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/dir1');
-    expect(wrapper.find('.register-model-btn-wrapper')).toHaveLength(0);
-  });
-  test('should render register model button for directory with MLmodel file', () => {
-    expect(Utils.isModelRegistryEnabled()).toEqual(true);
-    const props = { ...minimalProps };
-    wrapper = getWrapper(minimalStore, props);
-    const dir2Element = wrapper.find('NodeHeader').at(2);
-    dir2Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/dir2');
-    expect(wrapper.find('.register-model-btn-wrapper')).toHaveLength(1);
-  });
-  test('should not render register model button for directory when registry is disabled', () => {
-    const enabledSpy = jest.spyOn(Utils, 'isModelRegistryEnabled').mockImplementation(() => false);
-    expect(Utils.isModelRegistryEnabled()).toEqual(false);
-    const props = { ...minimalProps };
-    wrapper = getWrapper(minimalStore, props);
-    const dir1Element = wrapper.find('NodeHeader').at(1);
-    dir1Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/dir1');
-    expect(wrapper.find('.register-model-btn-wrapper')).toHaveLength(0);
-    enabledSpy.mockRestore();
-  });
-  test('should render model version link for directory when version is present', () => {
-    expect(Utils.isModelRegistryEnabled()).toEqual(true);
-    const modelVersionsBySource = {
-      'test_root/dir2': [mockModelVersionDetailed('Model A', 1, Stages.PRODUCTION, ModelVersionStatus.READY)],
-    };
-    const props = { ...minimalProps, modelVersionsBySource };
-    const entities = {
-      ...minimalEntities,
-      modelVersionsByModel: {
-        'Model A': {
-          1: {
-            ...mockModelVersionDetailed('Model A', 1, Stages.PRODUCTION, ModelVersionStatus.READY),
-            source: 'test_root/dir2',
-          },
+  describe('artifact download', () => {
+    let assignMock: jest.Mock;
+    let originalLocation: Location;
+    let originalRevokeObjectURL: any;
+    let createObjectURLSpy: any;
+    let revokeObjectURLMock: jest.Mock;
+    let anchor: any;
+    let presignedSpy: any;
+    let proxiedPresignedSpy: any;
+
+    const getImplInstance = (props: any = {}, options: { cachedMultipartDownloadsEnabled?: boolean } = {}) => {
+      const rootNode = new ArtifactNode(true, undefined, undefined);
+      rootNode.isLoaded = true;
+      const textFile = new ArtifactNode(
+        false,
+        {
+          path: 'summary.txt',
+          is_dir: false,
+          file_size: '100',
         },
-      },
+        undefined,
+      );
+      rootNode.setChildren([textFile.fileInfo]);
+      const mockProps = {
+        ...minimalProps,
+        artifactRootUri: 's3://bucket/0/fakeUuid/artifacts',
+        multipartDownloadsEnabled: true,
+        ...props,
+      };
+      wrapper =
+        options.cachedMultipartDownloadsEnabled === undefined
+          ? getWrapper(getMockStore(rootNode), mockProps)
+          : getWrapperWithServerInfo(getMockStore(rootNode), mockProps, options.cachedMultipartDownloadsEnabled);
+      wrapper.find('NodeHeader').at(0).simulate('click');
+      wrapper.update();
+      // Mock the DOM download plumbing only after enzyme has mounted the component:
+      // enzyme itself needs the real document.createElement to create its container.
+      createObjectURLSpy = jest.spyOn(URL, 'createObjectURL').mockReturnValue('blob:fake-url');
+      // jsdom does not implement URL.revokeObjectURL (and the test setup does not polyfill
+      // it), so jest.spyOn cannot be used here; the original value is restored in afterEach.
+      revokeObjectURLMock = jest.fn();
+      URL.revokeObjectURL = revokeObjectURLMock;
+      anchor = { href: '', download: '', click: jest.fn() };
+      jest.spyOn(document, 'createElement').mockReturnValue(anchor);
+      jest.spyOn(document.body, 'appendChild').mockImplementation(() => anchor);
+      jest.spyOn(document.body, 'removeChild').mockImplementation(() => anchor);
+      return wrapper.find('ArtifactViewImpl').instance() as any;
     };
-    const store = mockStore({
-      entities: entities,
+
+    const expectBlobDownload = (expectedUrlPart: string) => {
+      expect(getArtifactBlob).toHaveBeenCalledWith(expect.stringContaining(expectedUrlPart));
+      expect(createObjectURLSpy).toHaveBeenCalled();
+      expect(anchor.download).toBe('summary.txt');
+      expect(anchor.click).toHaveBeenCalled();
+      expect(revokeObjectURLMock).toHaveBeenCalledWith('blob:fake-url');
+    };
+
+    beforeEach(() => {
+      originalLocation = window.location;
+      originalRevokeObjectURL = (URL as any).revokeObjectURL;
+      assignMock = jest.fn();
+      // The download navigates the top-level page to a cross-origin (cloud storage) URL,
+      // which no router test utility models — mock `location.assign` directly.
+      // eslint-disable-next-line @databricks/no-mock-location
+      Object.defineProperty(window, 'location', {
+        value: { ...originalLocation, assign: assignMock },
+        writable: true,
+      });
+      presignedSpy = jest.spyOn(MlflowService, 'createPresignedDownloadUrl');
+      proxiedPresignedSpy = jest.spyOn(MlflowService, 'getMlflowArtifactsPresignedDownloadUrl');
+      jest.mocked(getArtifactBlob).mockClear();
     });
-    wrapper = getWrapper(store, props);
-    const dir2Element = wrapper.find('NodeHeader').at(2);
-    dir2Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/dir2');
-    expect(wrapper.find('.model-version-info')).toHaveLength(1);
-    expect(wrapper.find('.model-version-link')).toHaveLength(1);
-    expect(wrapper.find('.model-version-link').html()).toContain('Model A');
-    expect(wrapper.find('.model-version-link').html()).toContain('v1');
-  });
-  /**
-   * A model version's source may be semantically equivalent to a run artifact path
-   * but syntactically distinct; this occurs when there are redundant or trailing
-   * slashes present in the version source or run artifact path. This test verifies that,
-   * in these cases, model version information is still displayed correctly for a run artifact.
-   */
-  test('should render model version link for semantically equivalent artifact paths', () => {
-    expect(Utils.isModelRegistryEnabled()).toEqual(true);
-    // Construct a model version source that is semantically equivalent to a run artifact path
-    // but syntactically different because it contains extra slashes. We expect that the UI
-    // should still render the version source for this artifact
-    const modelVersionSource = 'test_root////dir2///';
-    const modelVersionsBySource = {
-      modelVersionSource: [mockModelVersionDetailed('Model A', 1, Stages.PRODUCTION, ModelVersionStatus.READY)],
-    };
-    const props = { ...minimalProps, modelVersionsBySource };
-    const entities = {
-      ...minimalEntities,
-      modelVersionsByModel: {
-        'Model A': {
-          1: {
-            ...mockModelVersionDetailed('Model A', 1, Stages.PRODUCTION, ModelVersionStatus.READY),
-            source: modelVersionSource,
-          },
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+      (URL as any).revokeObjectURL = originalRevokeObjectURL;
+      // eslint-disable-next-line @databricks/no-mock-location
+      Object.defineProperty(window, 'location', { value: originalLocation, writable: true });
+    });
+
+    test('should navigate to the presigned URL when the server provides one', async () => {
+      presignedSpy.mockResolvedValue({ presigned_url: 'https://s3.example.com/signed', file_size: 100 });
+
+      const implInstance = getImplInstance();
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(presignedSpy).toHaveBeenCalledWith({ run_id: 'fakeUuid', path: 'summary.txt' });
+      expect(assignMock).toHaveBeenCalledWith('https://s3.example.com/signed');
+      expect(getArtifactBlob).not.toHaveBeenCalled();
+    });
+
+    test('should navigate to the proxied artifact presigned URL when server-info enables multipart downloads', async () => {
+      proxiedPresignedSpy.mockResolvedValue({ url: 'https://s3.example.com/proxied-signed', file_size: 100 });
+
+      const implInstance = getImplInstance({ artifactRootUri: 'mlflow-artifacts:/0/fakeUuid/artifacts' });
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(proxiedPresignedSpy).toHaveBeenCalledWith('0/fakeUuid/artifacts/summary.txt');
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).toHaveBeenCalledWith('https://s3.example.com/proxied-signed');
+      expect(getArtifactBlob).not.toHaveBeenCalled();
+    });
+
+    test('should ignore the authority for mlflow-artifacts URIs', async () => {
+      proxiedPresignedSpy.mockResolvedValue({ url: 'https://s3.example.com/proxied-signed', file_size: 100 });
+
+      const implInstance = getImplInstance({
+        artifactRootUri: 'mlflow-artifacts://tracking.example.com/0/fakeUuid/artifacts',
+      });
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(proxiedPresignedSpy).toHaveBeenCalledWith('0/fakeUuid/artifacts/summary.txt');
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).toHaveBeenCalledWith('https://s3.example.com/proxied-signed');
+      expect(getArtifactBlob).not.toHaveBeenCalled();
+    });
+
+    test('should use cached server-info when deciding proxied artifact presigned downloads', async () => {
+      proxiedPresignedSpy.mockResolvedValue({ url: 'https://s3.example.com/proxied-signed', file_size: 100 });
+
+      const implInstance = getImplInstance(
+        {
+          artifactRootUri: 'mlflow-artifacts:/0/my%20run/artifacts',
+          multipartDownloadsEnabled: undefined,
         },
-      },
-    };
-    const store = mockStore({
-      entities: entities,
+        { cachedMultipartDownloadsEnabled: true },
+      );
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(proxiedPresignedSpy).toHaveBeenCalledWith('0/my run/artifacts/summary.txt');
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).toHaveBeenCalledWith('https://s3.example.com/proxied-signed');
+      expect(getArtifactBlob).not.toHaveBeenCalled();
     });
-    wrapper = getWrapper(store, props);
-    const dir2Element = wrapper.find('NodeHeader').at(2);
-    dir2Element.simulate('click');
-    expect(wrapper.find('.artifact-info-path').html()).toContain('test_root/dir2');
-    expect(wrapper.find('.model-version-info')).toHaveLength(1);
-    expect(wrapper.find('.model-version-link')).toHaveLength(1);
-    expect(wrapper.find('.model-version-link').html()).toContain('Model A');
-    expect(wrapper.find('.model-version-link').html()).toContain('v1');
-  });
-  test('should not render model version link for file under valid model version directory', () => {
-    expect(Utils.isModelRegistryEnabled()).toEqual(true);
-    const modelVersionsBySource = {
-      'test_root/dir2': [mockModelVersionDetailed('Model A', 1, Stages.PRODUCTION, ModelVersionStatus.READY)],
-    };
-    const props = { ...minimalProps, modelVersionsBySource };
-    const entities = {
-      ...minimalEntities,
-      modelVersionsByModel: {
-        'Model A': {
-          1: {
-            ...mockModelVersionDetailed('Model A', 1, Stages.PRODUCTION, ModelVersionStatus.READY),
-            source: 'test_root/dir2',
-          },
-        },
-      },
-    };
-    const store = mockStore({
-      entities: entities,
+
+    test('should decode and preserve proxied HTTP artifact root paths before route encoding', async () => {
+      proxiedPresignedSpy.mockResolvedValue({ url: 'https://s3.example.com/proxied-signed', file_size: 100 });
+
+      const implInstance = getImplInstance({
+        artifactRootUri:
+          'https://mlflow.example.com/prefix/api/2.0/mlflow-artifacts/artifacts/0/my%20run/api/2.0/mlflow-artifacts/artifacts/artifacts',
+      });
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(proxiedPresignedSpy).toHaveBeenCalledWith(
+        '0/my run/api/2.0/mlflow-artifacts/artifacts/artifacts/summary.txt',
+      );
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).toHaveBeenCalledWith('https://s3.example.com/proxied-signed');
+      expect(getArtifactBlob).not.toHaveBeenCalled();
     });
-    wrapper = getWrapper(store, props);
-    const dir2Element = wrapper.find('NodeHeader').at(2);
-    dir2Element.simulate('click');
-    const file4Element = wrapper.find('NodeHeader').at(3);
-    file4Element.simulate('click');
-    expect(wrapper.find('.model-version-info')).toHaveLength(0);
-    expect(wrapper.find('.model-version-link')).toHaveLength(0);
-    expect(wrapper.find('.artifact-info-link')).toHaveLength(1);
+
+    test('should use the run-scoped presigned URL for direct artifact roots when multipart downloads are disabled', async () => {
+      presignedSpy.mockResolvedValue({ presigned_url: 'https://s3.example.com/signed', file_size: 100 });
+
+      const implInstance = getImplInstance({ multipartDownloadsEnabled: false });
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(presignedSpy).toHaveBeenCalledWith({ run_id: 'fakeUuid', path: 'summary.txt' });
+      expect(proxiedPresignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).toHaveBeenCalledWith('https://s3.example.com/signed');
+      expect(getArtifactBlob).not.toHaveBeenCalled();
+    });
+
+    test('should use the proxied download for proxied artifact roots when server-info disables multipart downloads', async () => {
+      presignedSpy.mockResolvedValue({ presigned_url: 'https://s3.example.com/signed', file_size: 100 });
+      proxiedPresignedSpy.mockResolvedValue({ url: 'https://s3.example.com/proxied-signed', file_size: 100 });
+
+      const implInstance = getImplInstance({
+        artifactRootUri: 'mlflow-artifacts:/0/fakeUuid/artifacts',
+        multipartDownloadsEnabled: false,
+      });
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(proxiedPresignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).not.toHaveBeenCalled();
+      expectBlobDownload('get-artifact?path=summary.txt&run_uuid=fakeUuid');
+    });
+
+    test('should use the proxied download for HTTP proxied artifact roots when server-info disables multipart downloads', async () => {
+      presignedSpy.mockResolvedValue({ presigned_url: 'https://s3.example.com/signed', file_size: 100 });
+      proxiedPresignedSpy.mockResolvedValue({ url: 'https://s3.example.com/proxied-signed', file_size: 100 });
+
+      const implInstance = getImplInstance({
+        artifactRootUri: 'https://mlflow.example.com/api/2.0/mlflow-artifacts/artifacts/0/fakeUuid/artifacts',
+        multipartDownloadsEnabled: false,
+      });
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(proxiedPresignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).not.toHaveBeenCalled();
+      expectBlobDownload('get-artifact?path=summary.txt&run_uuid=fakeUuid');
+    });
+
+    test.each([400, 404, 501, 503])(
+      'should fall back to the proxied download when the presigned request fails with %s',
+      async (status) => {
+        presignedSpy.mockRejectedValue(new ErrorWrapper('unavailable', status));
+
+        const implInstance = getImplInstance();
+        await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+        expect(assignMock).not.toHaveBeenCalled();
+        expectBlobDownload('get-artifact?path=summary.txt&run_uuid=fakeUuid');
+      },
+    );
+
+    test.each([400, 404, 501, 503])(
+      'should fall back to the proxied download when the proxied presigned request fails with %s',
+      async (status) => {
+        proxiedPresignedSpy.mockRejectedValue(new ErrorWrapper('unavailable', status));
+
+        const implInstance = getImplInstance({ artifactRootUri: 'mlflow-artifacts:/0/fakeUuid/artifacts' });
+        await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+        expect(presignedSpy).not.toHaveBeenCalled();
+        expect(assignMock).not.toHaveBeenCalled();
+        expectBlobDownload('get-artifact?path=summary.txt&run_uuid=fakeUuid');
+      },
+    );
+
+    test('should fail closed without fallback when the presigned request is denied with 403', async () => {
+      const notifySpy = jest.spyOn(Utils, 'logErrorAndNotifyUser').mockImplementation(() => {});
+      presignedSpy.mockRejectedValue(new ErrorWrapper('permission denied', 403));
+
+      const implInstance = getImplInstance();
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(notifySpy).toHaveBeenCalled();
+      expect(assignMock).not.toHaveBeenCalled();
+      expect(getArtifactBlob).not.toHaveBeenCalled();
+    });
+
+    test('should notify the user when the proxied fallback download itself fails', async () => {
+      const notifySpy = jest.spyOn(Utils, 'logErrorAndNotifyUser').mockImplementation(() => {});
+      presignedSpy.mockRejectedValue(new ErrorWrapper('older server', 404));
+
+      const implInstance = getImplInstance();
+      jest.mocked(getArtifactBlob).mockRejectedValueOnce(new ErrorWrapper('missing artifact', 404));
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(getArtifactBlob).toHaveBeenCalled();
+      expect(notifySpy).toHaveBeenCalled();
+      expect(assignMock).not.toHaveBeenCalled();
+      expect(createObjectURLSpy).not.toHaveBeenCalled();
+    });
+
+    test('should use the proxied download when the presigned URL requires request headers', async () => {
+      presignedSpy.mockResolvedValue({
+        presigned_url: 'https://s3.example.com/signed',
+        headers: { 'x-required-header': 'value' },
+      });
+
+      const implInstance = getImplInstance();
+      await implInstance.onDownloadClick('fakeUuid', 'summary.txt');
+
+      expect(assignMock).not.toHaveBeenCalled();
+      expectBlobDownload('get-artifact?path=summary.txt&run_uuid=fakeUuid');
+    });
+
+    test('should download logged-model artifacts via the proxied path without a presigned request', async () => {
+      const implInstance = getImplInstance();
+      await implInstance.onDownloadClick(undefined, 'summary.txt', 'model-123');
+
+      expect(presignedSpy).not.toHaveBeenCalled();
+      expect(assignMock).not.toHaveBeenCalled();
+      expectBlobDownload('model-123');
+    });
   });
 });

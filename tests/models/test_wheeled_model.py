@@ -1,13 +1,14 @@
-import json
 import os
 import random
 import re
-from collections import namedtuple
+from io import BytesIO
+from typing import Any, NamedTuple
+from unittest import mock
 
 import numpy as np
 import pandas as pd
 import pytest
-import sklearn.neighbors as knn
+import sklearn.linear_model as logreg_module
 import yaml
 from sklearn import datasets
 
@@ -15,6 +16,7 @@ import mlflow
 import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
 from mlflow.exceptions import MlflowException
 from mlflow.models.model import METADATA_FILES
+from mlflow.models.utils import load_serving_example
 from mlflow.models.wheeled_model import _ORIGINAL_REQ_FILE_NAME, _WHEELS_FOLDER_NAME, WheeledModel
 from mlflow.pyfunc.model import MLMODEL_FILE_NAME, Model
 from mlflow.store.artifact.utils.models import _improper_model_uri_msg
@@ -37,7 +39,9 @@ EXTRA_PYFUNC_SERVING_TEST_ARGS = (
 )
 
 
-ModelWithData = namedtuple("ModelWithData", ["model", "inference_data"])
+class ModelWithData(NamedTuple):
+    model: Any
+    inference_data: Any
 
 
 @pytest.fixture(scope="module")
@@ -45,13 +49,13 @@ def sklearn_knn_model():
     iris = datasets.load_iris()
     X = iris.data[:, :2]  # we only take the first two features.
     y = iris.target
-    knn_model = knn.KNeighborsClassifier()
-    knn_model.fit(X, y)
-    return ModelWithData(model=knn_model, inference_data=X)
+    logreg_model = logreg_module.LogisticRegression()
+    logreg_model.fit(X, y)
+    return ModelWithData(model=logreg_model, inference_data=X)
 
 
 def random_int(lo=1, hi=1000000000):
-    return random.randint(lo, hi)
+    return random.randint(int(lo), int(hi))
 
 
 def _get_list_from_file(path):
@@ -79,9 +83,10 @@ def get_pip_requirements_from_conda_file(conda_env_path):
 
 def validate_updated_model_file(original_model_config, wheeled_model_config):
     differing_keys = {"run_id", "utc_time_created", "model_uuid", "artifact_path"}
+    ignore_keys = {"model_id"}
 
     # Compare wheeled model configs with original model config (MLModel files)
-    for key in original_model_config:
+    for key in original_model_config.keys() - ignore_keys:
         if key not in differing_keys:
             assert wheeled_model_config[key] == original_model_config[key]
         else:
@@ -90,11 +95,6 @@ def validate_updated_model_file(original_model_config, wheeled_model_config):
     # Wheeled model key should only exist in wheeled_model_config
     assert wheeled_model_config.get(_WHEELS_FOLDER_NAME, None)
     assert not original_model_config.get(_WHEELS_FOLDER_NAME, None)
-
-    # Verify new artifact path
-    assert wheeled_model_config["artifact_path"] == WheeledModel.get_wheel_artifact_path(
-        original_model_config["artifact_path"]
-    )
 
     # Every key in the original config should also exist in the wheeled config.
     for key in original_model_config:
@@ -107,9 +107,10 @@ def validate_updated_conda_dependencies(original_model_path, wheeled_model_path)
     wheeled_model_path = os.path.join(wheeled_model_path, _CONDA_ENV_FILE_NAME)
     original_conda_env_path = os.path.join(original_model_path, _CONDA_ENV_FILE_NAME)
 
-    with open(wheeled_model_path) as wheeled_conda_env, open(
-        original_conda_env_path
-    ) as original_conda_env:
+    with (
+        open(wheeled_model_path) as wheeled_conda_env,
+        open(original_conda_env_path) as original_conda_env,
+    ):
         wheeled_conda_env = yaml.safe_load(wheeled_conda_env)
         original_conda_env = yaml.safe_load(original_conda_env)
 
@@ -153,8 +154,8 @@ def test_model_log_load(tmp_path, sklearn_knn_model):
     # Log a model
     with mlflow.start_run():
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
         model_path = _download_artifact_from_uri(model_uri, tmp_path)
@@ -189,8 +190,8 @@ def test_model_save_load(tmp_path, sklearn_knn_model):
     # Log a model
     with mlflow.start_run():
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
         model_path = _download_artifact_from_uri(model_uri, model_download_path)
@@ -220,8 +221,8 @@ def test_logging_and_saving_wheeled_model_throws(tmp_path, sklearn_knn_model):
     # Log a model
     with mlflow.start_run():
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path=artifact_path,
+            sklearn_knn_model.model,
+            name=artifact_path,
             registered_model_name=model_name,
         )
 
@@ -278,7 +279,7 @@ def test_create_pip_requirement(tmp_path):
     )
     wm._create_pip_requirement(conda_env_path, pip_reqs_path)
     with open(pip_reqs_path) as f:
-        pip_reqs = [x.strip() for x in f.readlines()]
+        pip_reqs = [x.strip() for x in f]
     assert expected_pip_deps.sort() == pip_reqs.sort()
 
 
@@ -328,24 +329,25 @@ def test_serving_wheeled_model(sklearn_knn_model):
 
     # Log a model
     with mlflow.start_run():
-        mlflow.sklearn.log_model(
-            sk_model=model,
-            artifact_path=artifact_path,
+        model_info = mlflow.sklearn.log_model(
+            model,
+            name=artifact_path,
             registered_model_name=model_name,
+            input_example=pd.DataFrame(inference_data),
         )
 
     # Re-log with wheels
     with mlflow.start_run():
         WheeledModel.log_model(model_uri=model_uri)
 
-    data = json.dumps({"dataframe_split": pd.DataFrame(inference_data).to_dict(orient="split")})
+    inference_payload = load_serving_example(model_info.model_uri)
     resp = pyfunc_serve_and_score_model(
         wheeled_model_uri,
-        data=data,
+        data=inference_payload,
         content_type=pyfunc_scoring_server.CONTENT_TYPE_JSON,
         extra_args=EXTRA_PYFUNC_SERVING_TEST_ARGS,
     )
-    scores = pd.read_json(resp.content.decode("utf-8"), orient="records").values.squeeze()
+    scores = pd.read_json(BytesIO(resp.content), orient="records").values.squeeze()
     np.testing.assert_array_almost_equal(scores, model.predict(inference_data))
 
 
@@ -363,7 +365,7 @@ def test_wheel_download_works(tmp_path):
     assert simple_dependency in wheels[0]  # Cloudpickle wheel downloaded
 
 
-def test_wheel_download_override_option_works(tmp_path):
+def test_wheel_download_override_option_works(tmp_path, monkeypatch):
     dependency = "pyspark"
     requirements_file = os.path.join(tmp_path, "req.txt")
     wheel_dir = os.path.join(tmp_path, "wheels")
@@ -377,22 +379,130 @@ def test_wheel_download_override_option_works(tmp_path):
         WheeledModel._download_wheels(requirements_file, wheel_dir)
 
     # Set option override
-    os.environ["MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS"] = "--prefer-binary"
+    monkeypatch.setenv("MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", "--prefer-binary")
     WheeledModel._download_wheels(requirements_file, wheel_dir)
     assert len(os.listdir(wheel_dir))  # Wheel dir is not empty
 
 
-def test_copy_metadata(sklearn_knn_model):
+def test_wheel_download_dependency_conflicts(tmp_path):
+    reqs_file = tmp_path / "requirements.txt"
+    reqs_file.write_text("mlflow==2.15.0\nmlflow==2.16.0")
+    with pytest.raises(
+        MlflowException,
+        # Ensure the error message contains conflict details
+        match=r"Cannot install mlflow==2\.15\.0 and mlflow==2\.16\.0.+The conflict is caused by",
+    ):
+        WheeledModel._download_wheels(reqs_file, tmp_path / "wheels")
+
+
+def test_copy_metadata(mock_is_in_databricks, sklearn_knn_model):
     with mlflow.start_run():
         mlflow.sklearn.log_model(
-            sk_model=sklearn_knn_model.model,
-            artifact_path="model",
+            sklearn_knn_model.model,
+            name="model",
             registered_model_name="sklearn_knn_model",
         )
 
     with mlflow.start_run():
         model_info = WheeledModel.log_model(model_uri="models:/sklearn_knn_model/1")
-        artifact_path = mlflow.artifacts.download_artifacts(model_info.model_uri)
-        assert set(os.listdir(os.path.join(artifact_path, "metadata"))) == set(
-            METADATA_FILES + [_ORIGINAL_REQ_FILE_NAME]
+
+    artifact_path = mlflow.artifacts.download_artifacts(model_info.model_uri)
+    metadata_path = os.path.join(artifact_path, "metadata")
+    if mock_is_in_databricks.return_value:
+        assert set(os.listdir(metadata_path)) == set(METADATA_FILES + [_ORIGINAL_REQ_FILE_NAME])
+    else:
+        assert not os.path.exists(metadata_path)
+    assert mock_is_in_databricks.call_count == 2
+
+
+def test_wheel_download_prevents_command_injection(tmp_path, monkeypatch):
+    malicious_attempts = [
+        "--only-binary=:all: && echo pwned",
+        "--prefer-binary; rm -rf /",
+        "--no-binary=:none: | cat /etc/passwd",
+        "../../../etc/passwd",
+        "--extra-index-url http://evil.com",
+        "--find-links /tmp",
+        "--index-url http://malicious.com",
+        "--trusted-host evil.com",
+        "--only-binary=package`rm -rf /`",
+        "--config-settings malicious=value",
+    ]
+
+    for malicious_option in malicious_attempts:
+        monkeypatch.setenv("MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", malicious_option)
+        with pytest.raises(MlflowException, match="Invalid pip wheel option"):
+            WheeledModel._download_wheels(tmp_path / "req.txt", tmp_path / "wheels")
+
+
+def test_wheel_download_allowed_options(tmp_path, monkeypatch):
+    allowed_options = [
+        "--only-binary=:all:",
+        "--only-binary=:none:",
+        "--no-binary=:all:",
+        "--no-binary=:none:",
+        "--prefer-binary",
+        "--no-build-isolation",
+        "--use-pep517",
+        "--check-build-dependencies",
+        "--ignore-requires-python",
+        "--no-deps",
+        "--no-verify",
+        "--pre",
+        "--require-hashes",
+        "--no-clean",
+    ]
+
+    for option in allowed_options:
+        monkeypatch.setenv("MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", option)
+        with mock.patch("subprocess.run") as mock_run:
+            WheeledModel._download_wheels(tmp_path / "req.txt", tmp_path / "wheels")
+            mock_run.assert_called_once()
+            assert option in mock_run.call_args[0][0]
+
+    # test combination of options
+    monkeypatch.setenv("MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", "--prefer-binary --no-clean")
+    with mock.patch("subprocess.run") as mock_run:
+        WheeledModel._download_wheels(tmp_path / "req.txt", tmp_path / "wheels")
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert "--prefer-binary --no-clean" in call_args[0][0]
+
+
+def test_wheel_download_extra_envs(tmp_path, monkeypatch):
+    monkeypatch.setenv("MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", "--prefer-binary")
+    extra_envs = {
+        "PIP_INDEX_URL": "https://test.pypi.org/simple/",
+        "PIP_TRUSTED_HOST": "test.pypi.org",
+        "CUSTOM_VAR": "test_value",
+    }
+
+    with mock.patch("subprocess.run") as mock_run:
+        mock_run.return_value = mock.Mock(returncode=0)
+
+        WheeledModel._download_wheels(
+            tmp_path / "req.txt", tmp_path / "wheels", extra_envs=extra_envs
         )
+
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert "--prefer-binary" in call_args[0][0]
+        passed_env = call_args[1]["env"]
+        assert passed_env["PIP_INDEX_URL"] == "https://test.pypi.org/simple/"
+        assert passed_env["PIP_TRUSTED_HOST"] == "test.pypi.org"
+        assert passed_env["CUSTOM_VAR"] == "test_value"
+
+        # Verify original environment variables are preserved
+        assert passed_env["PATH"] == os.environ["PATH"]
+
+
+def test_wheel_download_no_extra_envs(tmp_path, monkeypatch):
+    monkeypatch.setenv("MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", "--prefer-binary")
+
+    with mock.patch("subprocess.run") as mock_run:
+        mock_run.return_value = mock.Mock(returncode=0)
+
+        WheeledModel._download_wheels(tmp_path / "req.txt", tmp_path / "wheels", extra_envs=None)
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert call_args[1]["env"] is None
