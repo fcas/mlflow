@@ -60,7 +60,7 @@ tenacity
 # Floor matches the supported minimum in mlflow/ml-package-versions.yml. Without it, a
 # transitive conflict in the combined ML env silently backtracks llama-index to an
 # unsupported 0.10.x (pydantic v1 models), which crashes Settings serialization.
-llama-index>=0.12.38
+llama-index>=0.14.23
 # Required for an agent example of mlflow.llama_index
 llama-index-agent-openai
 # Required by mlflow.langchain
