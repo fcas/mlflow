@@ -182,7 +182,7 @@ lint = [
   "pre-commit==4.6.1",
   "toml==0.10.2",
   "types-toml",
-  "mypy==1.17.1",
+  "mypy==2.3.0",
   "ty==0.0.24",
   "pydantic>=2.0",
   "clint",
